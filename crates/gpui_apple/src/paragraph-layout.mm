@@ -335,6 +335,7 @@ NSLineBreakMode breakMode(const GPUITextKitOptions &options) {
     }
 }
 - (void)showAttachmentCell:(NSCell *)cell inRect:(NSRect)rect characterIndex:(NSUInteger)index {
+    rect.origin.y -= rect.size.height;
     self.capture->attachments.push_back({index, 1, {rect.origin.x, rect.origin.y, rect.size.width, rect.size.height}});
 }
 @end

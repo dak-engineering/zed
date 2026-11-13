@@ -755,3 +755,193 @@ fn clipped_ltr_and_rtl_source_coverage_matches_native_container_intersection() -
     }
     Ok(())
 }
+
+#[test]
+fn attachment_frame_converts_native_baseline_anchor_to_flipped_top_left() -> Result<()> {
+    let system = system()?;
+    let text = "\u{fffc}";
+    let runs = [TextRun {
+        len: text.len(),
+        ..Default::default()
+    }];
+    let request = system
+        .attributed_paragraph_request(
+            text,
+            px(14.),
+            &runs,
+            ParagraphWidth::Bounded(px(160.)),
+            ParagraphDirection::LeftToRight,
+        )?
+        .with_paragraph_styles(vec![ParagraphStyleSpan {
+            source: 0..text.len(),
+            direction: ParagraphDirection::LeftToRight,
+            alignment: ParagraphAlignment::Left,
+            line_height: ParagraphLineHeight::Exact(px(30.)),
+            first_line_indent: px(0.),
+            head_indent: px(0.),
+            tail_indent: px(0.),
+            space_before: px(0.),
+            space_after: px(0.),
+        }])?
+        .with_attachments(vec![ParagraphAttachment {
+            source: 0..text.len(),
+            size: size(px(100.), px(24.)),
+            baseline_offset: px(0.),
+        }])?
+        .with_line_limit(ParagraphLineLimit {
+            max_lines: NonZeroUsize::new(1).ok_or("one line")?,
+            mode: ParagraphEllipsize::Tail,
+        });
+    let ParagraphLayout::LaidOut(geometry) = system.layout_paragraph(request)? else {
+        return Err("native layout".into());
+    };
+    assert_eq!(geometry.attachments.len(), 1);
+    let attachment = &geometry.attachments[0];
+    let line = &geometry.lines[0];
+    assert_eq!(attachment.bounds.size, size(px(100.), px(24.)));
+    assert_eq!(line.fragment_bounds.top(), px(0.));
+    assert_eq!(line.fragment_bounds.bottom(), px(30.));
+    assert_eq!(attachment.bounds.top(), px(-1.));
+    assert_eq!(attachment.bounds.bottom(), px(23.));
+    let native = standard_attachment_bounds(text, 0, 24.);
+    assert_eq!(native.origin.y, -1.);
+    assert_eq!(native.size.height, 31.);
+    assert_eq!(f64::from(attachment.bounds.top()), native.origin.y);
+    let short = standard_attachment_bounds(text, 0, 4.);
+    assert_eq!(short.origin.y, 0.);
+    assert_eq!(short.size.height, 30.);
+    assert_eq!(attachment.source, 0..3);
+    // SAFETY: The image and its standard AppKit attachment cell are retained on
+    // this thread; the cell baseline is returned by value.
+    unsafe {
+        let image: Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+        let image: Retained<AnyObject> = msg_send![image, initWithSize: NSSize::new(100., 24.)];
+        let cell: Allocated<AnyObject> = msg_send![class!(NSTextAttachmentCell), alloc];
+        let cell: Retained<AnyObject> = msg_send![cell, initImageCell: &*image];
+        let offset: objc2_foundation::NSPoint = msg_send![&*cell, cellBaselineOffset];
+        assert_eq!(offset, objc2_foundation::NSPoint::new(0., 0.));
+        let container: Allocated<AnyObject> = msg_send![class!(NSTextContainer), alloc];
+        let container: Retained<AnyObject> =
+            msg_send![container, initWithContainerSize: NSSize::new(160., 30.)];
+        let fragment = NSRect::new(
+            objc2_foundation::NSPoint::new(0., 0.),
+            NSSize::new(160., 30.),
+        );
+        let position = objc2_foundation::NSPoint::new(0., 23.);
+        let frame: NSRect = msg_send![&*cell, cellFrameForTextContainer: &*container, proposedLineFragment: fragment, glyphPosition: position, characterIndex: 0_usize];
+        assert_eq!(
+            frame,
+            NSRect::new(
+                objc2_foundation::NSPoint::new(0., 0.),
+                NSSize::new(100., 24.)
+            )
+        );
+        assert_eq!(attachment.bounds.origin, gpui::point(px(0.), px(-1.)));
+    }
+    Ok(())
+}
+
+#[test]
+fn attachment_frame_retains_its_prefix_advance_and_second_visual_line() -> Result<()> {
+    let system = system()?;
+    let text = "aa\nx\u{fffc}";
+    let runs = [TextRun {
+        len: text.len(),
+        ..Default::default()
+    }];
+    let request = system
+        .attributed_paragraph_request(
+            text,
+            px(14.),
+            &runs,
+            ParagraphWidth::Bounded(px(160.)),
+            ParagraphDirection::LeftToRight,
+        )?
+        .with_paragraph_styles(vec![ParagraphStyleSpan {
+            source: 0..text.len(),
+            direction: ParagraphDirection::LeftToRight,
+            alignment: ParagraphAlignment::Left,
+            line_height: ParagraphLineHeight::Exact(px(30.)),
+            first_line_indent: px(0.),
+            head_indent: px(0.),
+            tail_indent: px(0.),
+            space_before: px(0.),
+            space_after: px(0.),
+        }])?
+        .with_attachments(vec![ParagraphAttachment {
+            source: 4..7,
+            size: size(px(20.), px(24.)),
+            baseline_offset: px(0.),
+        }])?;
+    let ParagraphLayout::LaidOut(geometry) = system.layout_paragraph(request)? else {
+        return Err("native layout".into());
+    };
+    assert_eq!(geometry.lines.len(), 2);
+    assert_eq!(geometry.attachments.len(), 1);
+    let line = &geometry.lines[1];
+    let attachment = &geometry.attachments[0];
+    let start = line
+        .carets
+        .as_ref()
+        .ok_or("carets")?
+        .primary
+        .iter()
+        .find(|caret| caret.index == 4)
+        .ok_or("attachment caret")?;
+    assert!(start.x > px(0.));
+    assert_eq!(attachment.bounds.left(), start.x, "{geometry:?}");
+    assert_eq!(line.fragment_bounds.top(), px(30.));
+    assert_eq!(attachment.bounds.top(), px(26.));
+    assert_eq!(attachment.bounds.bottom(), px(50.));
+    assert_eq!(attachment.source, 4..7);
+    Ok(())
+}
+
+fn standard_attachment_bounds(text: &str, index: usize, height: f64) -> NSRect {
+    // SAFETY: The independent AppKit text storage, image cell, and native layout
+    // graph remain retained until its container-coordinate bounds are copied.
+    unsafe {
+        let source = NSString::from_str(text);
+        let storage: Allocated<AnyObject> = msg_send![class!(NSTextStorage), alloc];
+        let storage: Retained<AnyObject> = msg_send![storage, initWithString: &*source];
+        let range = NSRange::new(0, text.encode_utf16().count());
+        let font: Retained<AnyObject> = msg_send![class!(NSFont), systemFontOfSize: 14_f64];
+        let style: Retained<AnyObject> = msg_send![class!(NSMutableParagraphStyle), new];
+        let _: () = msg_send![&*style, setBaseWritingDirection: 0_isize];
+        let _: () = msg_send![&*style, setAlignment: 0_isize];
+        let _: () = msg_send![&*style, setMinimumLineHeight: 30_f64];
+        let _: () = msg_send![&*style, setMaximumLineHeight: 30_f64];
+        let font_key = NSString::from_str("NSFont");
+        let style_key = NSString::from_str("NSParagraphStyle");
+        let _: () = msg_send![&*storage, addAttribute: &*font_key, value: &*font, range: range];
+        let _: () = msg_send![&*storage, addAttribute: &*style_key, value: &*style, range: range];
+        let ascent: f64 = msg_send![&*font, ascender];
+        let descent: f64 = msg_send![&*font, descender];
+        let offset: Retained<AnyObject> =
+            msg_send![class!(NSNumber), numberWithDouble: ((30. - ascent + descent) / 2.).ceil()];
+        let baseline_key = NSString::from_str("NSBaselineOffset");
+        let _: () =
+            msg_send![&*storage, addAttribute: &*baseline_key, value: &*offset, range: range];
+        let image: Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+        let image: Retained<AnyObject> = msg_send![image, initWithSize: NSSize::new(100., height)];
+        let cell: Allocated<AnyObject> = msg_send![class!(NSTextAttachmentCell), alloc];
+        let cell: Retained<AnyObject> = msg_send![cell, initImageCell: &*image];
+        let attachment: Retained<AnyObject> = msg_send![class!(NSTextAttachment), new];
+        let _: () = msg_send![&*attachment, setAttachmentCell: &*cell];
+        let attachment_key = NSString::from_str("NSAttachment");
+        let _: () = msg_send![&*storage, addAttribute: &*attachment_key, value: &*attachment, range: NSRange::new(index, 1)];
+        let layout: Retained<AnyObject> = msg_send![class!(NSLayoutManager), new];
+        let _: () = msg_send![&*layout, setBackgroundLayoutEnabled: Bool::NO];
+        let _: () = msg_send![&*layout, setAllowsNonContiguousLayout: Bool::NO];
+        let _: () = msg_send![&*layout, setUsesFontLeading: Bool::NO];
+        let container: Allocated<AnyObject> = msg_send![class!(NSTextContainer), alloc];
+        let container: Retained<AnyObject> =
+            msg_send![container, initWithContainerSize: NSSize::new(160., f64::MAX)];
+        let _: () = msg_send![&*container, setLineFragmentPadding: 0_f64];
+        let _: () = msg_send![&*layout, addTextContainer: &*container];
+        let _: () = msg_send![&*storage, addLayoutManager: &*layout];
+        let _: () = msg_send![&*layout, ensureLayoutForTextContainer: &*container];
+        let glyph: usize = msg_send![&*layout, glyphIndexForCharacterAtIndex: index];
+        msg_send![&*layout, boundingRectForGlyphRange: NSRange::new(glyph, 1), inTextContainer: &*container]
+    }
+}
