@@ -19,6 +19,7 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
+type LayoutBatchFn = dyn FnMut(&mut Window, &mut App) + 'static;
 
 /// Construct a new list element
 pub fn list(
@@ -28,6 +29,7 @@ pub fn list(
     List {
         state,
         render_item: Box::new(render_item),
+        on_layout_batch: None,
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
     }
@@ -37,11 +39,27 @@ pub fn list(
 pub struct List {
     state: ListState,
     render_item: Box<RenderItemFn>,
+    on_layout_batch: Option<Box<LayoutBatchFn>>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
 }
 
 impl List {
+    /// Run before each item materialization batch, including inferred-size
+    /// measurement and each prepaint attempt after autoscroll.
+    ///
+    /// Use this to reset caller-owned ephemeral item data. All sibling items,
+    /// full-list measurements, and size probes within one attempt share a batch.
+    /// This does not reset persistent item state. Like the item renderer, the
+    /// callback must not borrow this list's state.
+    pub fn on_layout_batch(
+        mut self,
+        callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_layout_batch = Some(Box::new(callback));
+        self
+    }
+
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
@@ -1478,6 +1496,9 @@ impl Element for List {
                 style.overflow.y = Overflow::Scroll;
                 style.refine(&self.style);
                 window.with_text_style(style.text_style().cloned(), |window| {
+                    if let Some(callback) = &mut self.on_layout_batch {
+                        callback(window, cx);
+                    }
                     let state = &mut *self.state.0.borrow_mut();
 
                     let available_height = if let Some(last_bounds) = state.last_layout_bounds {
@@ -1585,6 +1606,9 @@ impl Element for List {
 
         let mut autoscroll = true;
         let layout = loop {
+            if let Some(callback) = &mut self.on_layout_batch {
+                callback(window, cx);
+            }
             match state.prepaint_items(
                 bounds,
                 padding,
@@ -3882,3 +3906,7 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "list-layout-batch-tests.rs"]
+mod layout_batch_tests;
