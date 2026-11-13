@@ -1546,6 +1546,14 @@ pub trait PlatformDispatcher: Send + Sync {
 
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
+    /// Produces final contextual paragraph geometry, including any requested selection,
+    /// from the same layout operation. Reports unsupported rather than silently omitting a request.
+    fn layout_paragraph(
+        &self,
+        _request: crate::ParagraphRequest<'_>,
+    ) -> Result<crate::ParagraphLayout> {
+        Ok(crate::ParagraphLayout::Unsupported)
+    }
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}

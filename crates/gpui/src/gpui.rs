@@ -43,6 +43,8 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+#[path = "paragraph-layout.rs"]
+mod paragraph_layout;
 mod path_builder;
 mod platform;
 mod platform_scheduler;
@@ -133,6 +135,7 @@ pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
 pub use keymap::*;
+pub use paragraph_layout::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;

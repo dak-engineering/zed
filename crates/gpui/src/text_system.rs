@@ -248,6 +248,13 @@ enum CachedFont {
 }
 
 impl TextSystem {
+    /// Delegates a validated request without substituting heuristic fitting on unsupported backends.
+    pub fn layout_paragraph(
+        &self,
+        request: crate::ParagraphRequest<'_>,
+    ) -> Result<crate::ParagraphLayout> {
+        self.platform_text_system.layout_paragraph(request)
+    }
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         let (sender, receiver) = async_channel::bounded(MAX_REPORTED_MISSING_GLYPHS);

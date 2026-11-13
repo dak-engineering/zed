@@ -14,8 +14,14 @@ pub mod process_info;
 
 #[cfg(feature = "font-kit")]
 mod open_type;
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+#[path = "paragraph-layout.rs"]
+mod paragraph_layout;
 #[cfg(feature = "font-kit")]
 mod text_system;
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+#[path = "source-indices.rs"]
+mod source_indices;
 
 use objc2::MainThreadMarker;
 

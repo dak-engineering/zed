@@ -80,6 +80,57 @@ struct AppleTextSystemState {
 }
 
 impl AppleTextSystem {
+    /// Fits and shapes a paragraph with this text system's resolved fonts.
+    /// Native objects are created, used and destroyed on the calling thread.
+    #[cfg(target_os = "macos")]
+    fn layout_native_paragraph(
+        &self,
+        request: gpui::ParagraphRequest<'_>,
+    ) -> Result<gpui::ParagraphGeometry> {
+        let text = request.text();
+        let font_size = request.font_size();
+        let runs = request.runs();
+        let empty_run;
+        let runs = if text.is_empty() && runs.is_empty() {
+            empty_run = [FontRun {
+                len: 0,
+                font_id: self.font_id(&Font::default())?,
+            }];
+            &empty_run[..]
+        } else {
+            runs
+        };
+        let fonts = {
+            let state = self.0.read();
+            let mut alternate = false;
+            let mut fonts = Vec::with_capacity(runs.len());
+            for run in runs {
+                let font = state
+                    .fonts
+                    .get(run.font_id.0)
+                    .ok_or_else(|| anyhow!("unknown paragraph font id"))?;
+                let size = if alternate {
+                    f32::from(font_size).next_up()
+                } else {
+                    font_size.into()
+                };
+                fonts.push((
+                    run.len,
+                    font.native_font().clone_with_font_size(size.into()),
+                ));
+                if run.len > 0 {
+                    alternate = !alternate;
+                }
+            }
+            fonts
+        };
+        crate::paragraph_layout::layout(&request, &fonts, |font| {
+            let mut state = self.0.write();
+            let id = state.id_for_native_font(font);
+            (id, state.is_emoji(id))
+        })
+    }
+
     /// Create a new AppleTextSystem.
     pub fn new() -> Self {
         Self(RwLock::new(AppleTextSystemState {
@@ -101,6 +152,14 @@ impl Default for AppleTextSystem {
 }
 
 impl PlatformTextSystem for AppleTextSystem {
+    #[cfg(target_os = "macos")]
+    fn layout_paragraph(
+        &self,
+        request: gpui::ParagraphRequest<'_>,
+    ) -> Result<gpui::ParagraphLayout> {
+        self.layout_native_paragraph(request)
+            .map(gpui::ParagraphLayout::LaidOut)
+    }
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }

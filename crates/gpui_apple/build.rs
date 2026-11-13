@@ -3,6 +3,19 @@
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     apple_build::run();
+    #[cfg(all(target_os = "macos", feature = "font-kit"))]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .cpp(true)
+            .file("src/paragraph-layout.mm")
+            .flag("-std=c++17")
+            .flag("-fobjc-arc")
+            .flag("-fobjc-arc-exceptions")
+            .compile("gpui_textkit_layout");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rerun-if-changed=src/paragraph-layout.mm");
+        println!("cargo:rerun-if-changed=src/paragraph-layout.h");
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
