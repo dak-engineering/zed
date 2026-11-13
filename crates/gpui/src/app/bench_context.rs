@@ -1208,6 +1208,23 @@ impl<'a, 'measurement> BenchWindowContext<'a, 'measurement> {
             .expect("benchmark window was unexpectedly closed")
     }
 
+    /// Changes display scale through the platform callback before the next benchmark frame.
+    /// Must be called outside `update`, as the callback updates the window.
+    pub fn simulate_scale_factor_change(&mut self, scale_factor: f32) {
+        let mut platform_window = {
+            let mut app = self.cx.app.borrow_mut();
+            app.windows
+                .get_mut(self.window.window_id())
+                .and_then(|window| window.as_deref_mut())
+                .expect("benchmark window was unexpectedly closed")
+                .platform_window
+                .as_test()
+                .expect("benchmark platform window")
+                .clone()
+        };
+        platform_window.simulate_scale_factor_change(scale_factor);
+    }
+
     /// Resizes the window's content area as the platform does when the user drags its
     /// edge, through the window's resize callback. The next frame redraws at the new size.
     ///
