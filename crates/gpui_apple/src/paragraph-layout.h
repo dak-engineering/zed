@@ -49,6 +49,7 @@ extern "C" {
 // before keeping their identities; return false to stop. Never unwind through C++.
 typedef bool (*GPUITextKitEmit)(void *context, const GPUITextKitLayout *row);
 }
+enum class GPUITextKitDirection : uint8_t { Natural, LeftToRight, RightToLeft };
 enum class GPUITextKitCaretMode : uint8_t { All, None, Source };
 struct GPUITextKitCaretRequest {
     GPUITextKitCaretMode mode;
@@ -71,7 +72,7 @@ struct GPUITextKitOptions {
 };
 extern "C" {
 GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
-    const GPUITextKitFontRun *runs, size_t count, double width, bool rtl, const GPUITextKitOptions *options);
+    const GPUITextKitFontRun *runs, size_t count, double width, GPUITextKitDirection direction, const GPUITextKitOptions *options);
 void gpui_textkit_layout_drop(GPUITextKitLayout *layout);
 const GPUITextKitRect *gpui_textkit_selection_rects(const GPUITextKitLayout *layout, size_t *count);
 const GPUITextKitLine *gpui_textkit_line(const GPUITextKitLayout *layout);

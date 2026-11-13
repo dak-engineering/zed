@@ -145,11 +145,16 @@ public:
     }
 };
 
-NSMutableParagraphStyle *paragraphStyle(bool rtl, const GPUITextKitOptions &options) {
+NSMutableParagraphStyle *paragraphStyle(GPUITextKitDirection direction, const GPUITextKitOptions &options) {
     const auto &height = options.lineHeight;
     if (!std::isfinite(height.height)) return nil;
     NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
-    style.baseWritingDirection = rtl ? NSWritingDirectionRightToLeft : NSWritingDirectionLeftToRight;
+    switch (direction) {
+        case GPUITextKitDirection::Natural: style.baseWritingDirection = NSWritingDirectionNatural; break;
+        case GPUITextKitDirection::LeftToRight: style.baseWritingDirection = NSWritingDirectionLeftToRight; break;
+        case GPUITextKitDirection::RightToLeft: style.baseWritingDirection = NSWritingDirectionRightToLeft; break;
+        default: return nil;
+    }
     style.lineBreakMode = NSLineBreakByWordWrapping;
     switch (height.mode) {
         case GPUITextKitLineHeightMode::Natural:
@@ -222,7 +227,10 @@ NSMutableAttributedString *configuredSource(const uint16_t *text, size_t length,
                 case NSTextAlignmentLeft: break;
                 case NSTextAlignmentCenter: x = NSMidX(fragment); break;
                 case NSTextAlignmentRight: x = NSMaxX(fragment); break;
-                default: if (self.emptyRightToLeft) x = NSMaxX(fragment); break;
+                default:
+                    if (self.emptyStyle.baseWritingDirection == NSWritingDirectionNatural) x = used.origin.x;
+                    else if (self.emptyRightToLeft) x = NSMaxX(fragment);
+                    break;
             }
         }
         used.origin.x = x;
@@ -297,7 +305,7 @@ bool captureRows(GPUITextKitCapture *layout, const GPUITextKitOptions &options, 
 }
 
 GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
-    const GPUITextKitFontRun *runs, size_t count, double width, bool rtl, const GPUITextKitOptions *options) {
+    const GPUITextKitFontRun *runs, size_t count, double width, GPUITextKitDirection direction, const GPUITextKitOptions *options) {
     try {
         @autoreleasepool {
             @try {
@@ -311,7 +319,7 @@ GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
                 const auto *selection = options->selection;
                 if (selection && (selection->start > length || selection->length > length - selection->start)) return nullptr;
                 auto output = std::make_unique<GPUITextKitLayout>();
-                NSMutableParagraphStyle *style = paragraphStyle(rtl, *options);
+                NSMutableParagraphStyle *style = paragraphStyle(direction, *options);
                 if (!style) return nullptr;
                 NSMutableAttributedString *attributed = configuredSource(text, length, runs, count, style, options->lineHeight);
                 if (!attributed) return nullptr;
@@ -322,7 +330,7 @@ GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
                 layout.capture = output.get();
                 layout.valid = YES;
                 if (length == 0) layout.emptyFont = (__bridge NSFont *)runs[count - 1].font;
-                layout.emptyRightToLeft = rtl;
+                layout.emptyRightToLeft = direction == GPUITextKitDirection::RightToLeft;
                 layout.emptyStyle = style;
                 layout.backgroundLayoutEnabled = NO;
                 layout.allowsNonContiguousLayout = NO;

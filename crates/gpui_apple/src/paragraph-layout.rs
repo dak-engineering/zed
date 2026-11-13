@@ -9,8 +9,9 @@ use core_foundation::base::TCFType;
 use core_text::font::{CTFont, CTFontRef};
 use gpui::{
     Bounds, FontId, GlyphId, ParagraphAlignment, ParagraphBidiRun, ParagraphCaret,
-    ParagraphCaretCoverage, ParagraphCarets, ParagraphGeometry, ParagraphGlyph, ParagraphLine,
-    ParagraphLineHeight, ParagraphRequest, ParagraphWidth, Pixels, ShapedGlyph, point, px, size,
+    ParagraphCaretCoverage, ParagraphCarets, ParagraphDirection, ParagraphGeometry, ParagraphGlyph,
+    ParagraphLine, ParagraphLineHeight, ParagraphRequest, ParagraphWidth, Pixels,
+    ResolvedParagraphDirection, ShapedGlyph, point, px, size,
 };
 use std::{ffi::c_void, ops::Range, ptr::NonNull};
 
@@ -174,6 +175,7 @@ struct Receiver<F> {
     length: usize,
     boundaries: SourceIndices,
     carets: ParagraphCaretCoverage,
+    direction: ParagraphDirection,
     lines: Vec<ParagraphLine>,
     fonts: HashMap<CTFontRef, CachedFont>,
     register: F,
@@ -192,7 +194,14 @@ impl<F: FnMut(CTFont) -> (FontId, bool)> Receiver<F> {
                 .get(index)
                 .context("native offset splits a source scalar")
         };
-        let mut line = source_line(native, self.length, consumed, &self.carets, &byte)?;
+        let mut line = source_line(
+            native,
+            self.length,
+            consumed,
+            &self.carets,
+            self.direction,
+            &byte,
+        )?;
         shaped_glyphs(
             native,
             &mut line,
@@ -225,7 +234,7 @@ unsafe extern "C" {
         runs: *const NativeFontRun,
         count: usize,
         width: f64,
-        rtl: bool,
+        direction: u8,
         options: *const NativeOptions,
     ) -> *mut NativeLayout;
     fn gpui_textkit_layout_drop(layout: *mut NativeLayout);
@@ -298,6 +307,7 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
         length: text.len(),
         boundaries,
         carets: request.carets().clone(),
+        direction: request.direction(),
         lines: Vec::new(),
         fonts: HashMap::default(),
         register,
@@ -313,7 +323,11 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
             runs.as_ptr(),
             runs.len(),
             width.into(),
-            request.direction() == gpui::ParagraphDirection::RightToLeft,
+            match request.direction() {
+                ParagraphDirection::Natural => 0,
+                ParagraphDirection::LeftToRight => 1,
+                ParagraphDirection::RightToLeft => 2,
+            },
             &options,
         )
     };
@@ -357,6 +371,7 @@ fn source_line(
     length: usize,
     consumed: usize,
     wanted: &ParagraphCaretCoverage,
+    direction: ParagraphDirection,
     byte: &impl Fn(usize) -> anyhow::Result<usize>,
 ) -> anyhow::Result<ParagraphLine> {
     let carets = native_carets(native)?;
@@ -400,6 +415,11 @@ fn source_line(
         .get(split..end)
         .context("invalid native alternate caret range")?;
     Ok(ParagraphLine {
+        base_direction: match direction {
+            ParagraphDirection::Natural => None,
+            ParagraphDirection::LeftToRight => Some(ResolvedParagraphDirection::LeftToRight),
+            ParagraphDirection::RightToLeft => Some(ResolvedParagraphDirection::RightToLeft),
+        },
         carets: if line.carets_available {
             Some(ParagraphCarets {
                 primary: source_carets(primary, &source, byte)?,
@@ -617,3 +637,7 @@ fn shaped_glyphs(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "natural-direction-tests.rs"]
+mod natural_direction_tests;

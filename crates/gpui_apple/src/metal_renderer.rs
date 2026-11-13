@@ -1394,6 +1394,11 @@ impl MetalRenderer {
                 instance_bindings.surfaces.offset,
                 SurfaceInputIndex::Surfaces as usize,
             );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&instance_bindings.surfaces.buffer),
+                instance_bindings.surfaces.offset,
+                SurfaceInputIndex::Surfaces as usize,
+            );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&viewport_size).cast(),
                 mem::size_of_val(&viewport_size),
@@ -1685,6 +1690,9 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            corner_bounds: surface.corner_bounds,
+            corner_radii: surface.corner_radii,
+            opacity: surface.opacity,
         }))?,
     })
 }
@@ -1878,11 +1886,14 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_bounds: Bounds<ScaledPixels>,
+    pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub opacity: f32,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -2038,8 +2049,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn render_core_video_surface() {
+    fn gray_surface_buffer() -> CFRetained<objc2_core_video::CVPixelBuffer> {
+        // SAFETY: CoreVideo exports a process-lifetime dictionary key.
         let surface_properties_key = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
         let attributes = CFDictionary::from_slices(
             &[surface_properties_key],
@@ -2047,6 +2058,7 @@ mod tests {
         );
         let mut image_buffer = ptr::null_mut();
         assert_eq!(
+            // SAFETY: The attributes are live and CoreVideo initializes the out pointer.
             unsafe {
                 CVPixelBufferCreate(
                     None,
@@ -2060,7 +2072,9 @@ mod tests {
             kCVReturnSuccess
         );
         let image_buffer = ptr::NonNull::new(image_buffer).unwrap();
+        // SAFETY: The successful create call transfers one retained reference.
         let image_buffer = unsafe { CFRetained::from_raw(image_buffer) };
+        // SAFETY: Each locked plane is filled within its reported row stride and height.
         unsafe {
             assert_eq!(
                 CVPixelBufferLockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
@@ -2078,6 +2092,12 @@ mod tests {
             );
         }
 
+        image_buffer
+    }
+
+    #[test]
+    fn render_core_video_surface() {
+        let image_buffer = gray_surface_buffer();
         let bounds = Bounds {
             origin: Point::default(),
             size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
@@ -2087,6 +2107,9 @@ mod tests {
             order: 0,
             bounds,
             content_mask: ContentMask { bounds },
+            corner_bounds: bounds,
+            corner_radii: gpui::Corners::default(),
+            opacity: 1.,
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
@@ -2140,5 +2163,130 @@ mod tests {
         command_buffer.waitUntilCompleted();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
+    }
+    fn styled_surface_scene(
+        opacity: f32,
+        corner_bounds: Bounds<ScaledPixels>,
+        corner_radii: gpui::Corners<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Scene {
+        let bounds = Bounds::new(Point::default(), size(ScaledPixels(16.), ScaledPixels(16.)));
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::rgb(0xff0000).into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            corner_bounds,
+            corner_radii,
+            opacity,
+            image_buffer: gray_surface_buffer(),
+        });
+        scene.finish();
+        scene
+    }
+
+    fn assert_surface_pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
+        let actual = image.get_pixel(x, y).0;
+        for (channel, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                channel.abs_diff(expected) <= 3,
+                "pixel ({x}, {y}): {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_opacity_blends_native_video_pixels_over_existing_content() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let bounds = Bounds::new(Point::default(), size(ScaledPixels(16.), ScaledPixels(16.)));
+        for (opacity, expected) in [
+            (0., [255, 0, 0, 255]),
+            (0.5, [191, 64, 64, 255]),
+            (1., [128, 128, 128, 255]),
+        ] {
+            let scene = styled_surface_scene(
+                opacity,
+                bounds,
+                gpui::Corners::default(),
+                ContentMask { bounds },
+            );
+            let image =
+                renderer.render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))?;
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_surface_pixel(&image, x, y, expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_surfaces_clip_video_corners_and_compose_with_opacity() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let bounds = Bounds::new(Point::default(), size(ScaledPixels(16.), ScaledPixels(16.)));
+        for (opacity, interior) in [(1., [128, 128, 128, 255]), (0.5, [191, 64, 64, 255])] {
+            let scene = styled_surface_scene(
+                opacity,
+                bounds,
+                gpui::Corners::all(ScaledPixels(6.)),
+                ContentMask { bounds },
+            );
+            let image =
+                renderer.render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))?;
+            for (x, y) in [(0, 0), (15, 0), (0, 15), (15, 15)] {
+                assert_surface_pixel(&image, x, y, [255, 0, 0, 255]);
+            }
+            for (x, y) in [(8, 8), (3, 3), (8, 0), (0, 8)] {
+                assert_surface_pixel(&image, x, y, interior);
+            }
+            if opacity == 1. {
+                assert_surface_pixel(&image, 1, 1, [238, 17, 17, 255]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surface_rounding_uses_each_corner_and_intersects_frame_and_content_masks() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let bounds = Bounds::new(Point::default(), size(ScaledPixels(16.), ScaledPixels(16.)));
+        let radii = gpui::Corners {
+            top_left: ScaledPixels(6.),
+            ..Default::default()
+        };
+        let scene = styled_surface_scene(1., bounds, radii, ContentMask { bounds });
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))?;
+        assert_surface_pixel(&image, 0, 0, [255, 0, 0, 255]);
+        for (x, y) in [(15, 0), (0, 15), (15, 15)] {
+            assert_surface_pixel(&image, x, y, [128, 128, 128, 255]);
+        }
+        let frame = Bounds::new(
+            point(ScaledPixels(4.), ScaledPixels(4.)),
+            size(ScaledPixels(8.), ScaledPixels(8.)),
+        );
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(6.), ScaledPixels(0.)),
+                size(ScaledPixels(10.), ScaledPixels(16.)),
+            ),
+        };
+        let scene = styled_surface_scene(1., frame, gpui::Corners::all(ScaledPixels(4.)), mask);
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))?;
+        for (x, y) in [(2, 8), (5, 8), (4, 4), (8, 13), (12, 8)] {
+            assert_surface_pixel(&image, x, y, [255, 0, 0, 255]);
+        }
+        for (x, y) in [(8, 8), (8, 5), (6, 8)] {
+            assert_surface_pixel(&image, x, y, [128, 128, 128, 255]);
+        }
+        Ok(())
     }
 }

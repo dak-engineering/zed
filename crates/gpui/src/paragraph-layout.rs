@@ -2,12 +2,23 @@ use crate::{Bounds, FontId, FontRun, Pixels, ShapedGlyph, px};
 use anyhow::{Context as _, ensure};
 use std::{borrow::Cow, ops::Range};
 
-/// Resolved paragraph base direction; automatic direction is resolved by the caller.
+/// Requested paragraph base direction, including native automatic resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParagraphDirection {
+    /// Delegate paragraph base direction to the platform text system.
+    Natural,
     /// Left-to-right paragraph base.
     LeftToRight,
     /// Right-to-left paragraph base.
+    RightToLeft,
+}
+
+/// A paragraph base direction known independently of visual glyph order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedParagraphDirection {
+    /// Resolved left-to-right paragraph base.
+    LeftToRight,
+    /// Resolved right-to-left paragraph base.
     RightToLeft,
 }
 
@@ -303,6 +314,9 @@ pub struct ParagraphBidiRun {
 /// One consumed source range and its final native layout, without substring reshaping.
 #[derive(Debug)]
 pub struct ParagraphLine {
+    /// Reliable base direction when the platform exposes it. Native automatic
+    /// layout may leave this unknown; glyph embedding levels are not a substitute.
+    pub base_direction: Option<ResolvedParagraphDirection>,
     /// Consumed UTF-8 bytes, including any line terminator. A final empty caret row uses EOF..EOF.
     pub source: Range<usize>,
     /// Native used rectangle in paragraph coordinates.

@@ -3099,7 +3099,7 @@ impl Window {
 
     /// Borrows the most recently rendered frame's scene, so benchmarks can validate their
     /// output and report batch counts without cloning it.
-    #[cfg(feature = "bench-support")]
+    #[cfg(any(test, feature = "bench-support"))]
     pub fn rendered_scene(&self) -> &Scene {
         &self.rendered_frame.scene
     }
@@ -5409,16 +5409,37 @@ impl Window {
         bounds: Bounds<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
     ) {
+        self.paint_surface_with_corner_radii(bounds, bounds, Corners::default(), image_buffer);
+    }
+
+    /// Paint a surface clipped to a rounded frame at the current inherited opacity.
+    ///
+    /// `bounds` positions the image; `corner_bounds` positions its clipping frame.
+    /// This method should only be called during element painting.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn paint_surface_with_corner_radii(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        image_buffer: CFRetained<CVPixelBuffer>,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
-
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(corner_bounds.size)
+            .scale(self.scale_factor());
         let bounds = self.snap_bounds(bounds);
+        let corner_bounds = self.snap_bounds(corner_bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_bounds,
+            corner_radii,
+            opacity: self.element_opacity(),
             image_buffer,
         });
     }

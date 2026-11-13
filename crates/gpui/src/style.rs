@@ -37,6 +37,8 @@ pub enum ObjectFit {
     ScaleDown,
     /// The image will maintain its original size.
     None,
+    /// The image will maintain its original size, centered within the element.
+    Center,
 }
 
 impl ObjectFit {
@@ -130,6 +132,13 @@ impl ObjectFit {
                     size: new_size,
                 }
             }
+            ObjectFit::Center => Bounds {
+                origin: point(
+                    bounds.origin.x + (bounds.size.width - image_size.width) / 2.0,
+                    bounds.origin.y + (bounds.size.height - image_size.height) / 2.0,
+                ),
+                size: image_size,
+            },
             ObjectFit::None => Bounds {
                 origin: bounds.origin,
                 size: image_size,
@@ -1331,6 +1340,21 @@ impl From<Position> for taffy::style::Position {
 #[cfg(test)]
 mod tests {
     use crate::{blue, green, px, red, yellow};
+
+    #[test]
+    fn centered_original_size_images_keep_pixels_and_center_both_crop_directions() {
+        let frame = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(80.)));
+        for (width, height, x, y) in [(400, 200, -90., -40.), (40, 20, 90., 50.)] {
+            let image = size(DevicePixels(width), DevicePixels(height));
+            let centered = ObjectFit::Center.get_bounds(frame, image);
+            assert_eq!(centered.origin, point(px(x), px(y)));
+            assert_eq!(centered.size, size(px(width as f32), px(height as f32)));
+            assert_eq!(
+                ObjectFit::None.get_bounds(frame, image).origin,
+                frame.origin
+            );
+        }
+    }
 
     use super::*;
 
