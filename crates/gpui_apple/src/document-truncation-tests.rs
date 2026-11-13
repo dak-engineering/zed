@@ -122,11 +122,106 @@ fn oracle(fixture: &Fixture<'_>) -> Vec<OracleLine> {
         let _: () = msg_send![&*layout, addTextContainer: &*container];
         let _: () = msg_send![&*storage, addLayoutManager: &*layout];
         let _: () = msg_send![&*layout, ensureLayoutForTextContainer: &*container];
-        oracle_lines(&layout, &container, fixture.lines)
+        oracle_lines(&layout, &container, fixture.lines, fixture.mode)
     }
 }
 
-fn oracle_lines(layout: &AnyObject, container: &AnyObject, limit: usize) -> Vec<OracleLine> {
+fn oracle_replacement_range(layout: &AnyObject, row: NSRange) -> Option<NSRange> {
+    use core_foundation::base::TCFType as _;
+    // SAFETY: The caller retains the fully laid out native graph. Font objects
+    // are borrowed from its storage and retained by CTFont's get-rule wrapper.
+    unsafe {
+        let storage: Retained<AnyObject> = msg_send![layout, textStorage];
+        let key = NSString::from_str("NSFont");
+        for index in row.location..row.location + row.length {
+            let shown: Bool = msg_send![layout, notShownAttributeForGlyphAtIndex: index];
+            if shown.as_bool() {
+                continue;
+            }
+            let character: usize = msg_send![layout, characterIndexForGlyphAtIndex: index];
+            let font: Retained<AnyObject> = msg_send![&*storage, attribute: &*key, atIndex: character, effectiveRange: std::ptr::null_mut::<NSRange>()];
+            let font = core_text::font::CTFont::wrap_under_get_rule(Retained::as_ptr(&font).cast());
+            let mut ellipsis = 0_u16;
+            if !font.get_glyphs_for_characters(&0x2026_u16, &mut ellipsis, 1) {
+                continue;
+            }
+            let actual: u16 = msg_send![layout, CGGlyphAtIndex: index];
+            if actual != ellipsis {
+                continue;
+            }
+            let mut start = index;
+            let mut end = index + 1;
+            while start > row.location {
+                let property: isize = msg_send![layout, propertyForGlyphAtIndex: start - 1];
+                let hidden: Bool = msg_send![layout, notShownAttributeForGlyphAtIndex: start - 1];
+                if property & 1 == 0 || !hidden.as_bool() {
+                    break;
+                }
+                start -= 1;
+            }
+            while end < row.location + row.length {
+                let property: isize = msg_send![layout, propertyForGlyphAtIndex: end];
+                let hidden: Bool = msg_send![layout, notShownAttributeForGlyphAtIndex: end];
+                if property & 1 == 0 || !hidden.as_bool() {
+                    break;
+                }
+                end += 1;
+            }
+            if end - start > 1 {
+                return Some(NSRange::new(start, end - start));
+            }
+        }
+        None
+    }
+}
+
+fn clipped_cluster_range(
+    layout: &AnyObject,
+    container: &AnyObject,
+    glyphs: NSRange,
+    fragment: NSRect,
+) -> NSRange {
+    // SAFETY: The caller retains a laid-out AppKit object graph. Cluster and
+    // bounding ranges are copied from its native public layout queries.
+    unsafe {
+        let used: NSRect = msg_send![layout, lineFragmentUsedRectForGlyphAtIndex: glyphs.location, effectiveRange: std::ptr::null_mut::<NSRange>(), withoutAdditionalLayout: Bool::YES];
+        if used.size.width < fragment.size.width {
+            return msg_send![layout, characterRangeForGlyphRange: glyphs, actualGlyphRange: std::ptr::null_mut::<NSRange>()];
+        }
+        let mut first = usize::MAX;
+        let mut end = 0;
+        let mut cursor = glyphs.location;
+        while cursor < glyphs.location + glyphs.length {
+            let mut cluster = NSRange::new(0, 0);
+            let characters: NSRange = msg_send![layout, characterRangeForGlyphRange: NSRange::new(cursor, 1), actualGlyphRange: &mut cluster];
+            let bounds: NSRect =
+                msg_send![layout, boundingRectForGlyphRange: cluster, inTextContainer: container];
+            if bounds.size.width > 0.
+                && bounds.size.height > 0.
+                && bounds.origin.x < fragment.origin.x + fragment.size.width
+                && bounds.origin.x + bounds.size.width > fragment.origin.x
+                && bounds.origin.y < fragment.origin.y + fragment.size.height
+                && bounds.origin.y + bounds.size.height > fragment.origin.y
+            {
+                first = first.min(characters.location);
+                end = end.max(characters.location + characters.length);
+            }
+            cursor = (cursor + 1).max(cluster.location + cluster.length);
+        }
+        assert!(
+            first < end,
+            "native clip has no intersecting source cluster"
+        );
+        NSRange::new(first, end - first)
+    }
+}
+
+fn oracle_lines(
+    layout: &AnyObject,
+    container: &AnyObject,
+    limit: usize,
+    mode: ParagraphEllipsize,
+) -> Vec<OracleLine> {
     // SAFETY: The caller retains the fully laid out native object graph. Native
     // insertion count is queried before allocating its output buffers.
     unsafe {
@@ -139,9 +234,22 @@ fn oracle_lines(layout: &AnyObject, container: &AnyObject, limit: usize) -> Vec<
             let fragment: NSRect = msg_send![layout, lineFragmentRectForGlyphAtIndex: cursor, effectiveRange: &mut range, withoutAdditionalLayout: Bool::YES];
             let used: NSRect = msg_send![layout, lineFragmentUsedRectForGlyphAtIndex: cursor, effectiveRange: std::ptr::null_mut::<NSRange>(), withoutAdditionalLayout: Bool::YES];
             let source: NSRange = msg_send![layout, characterRangeForGlyphRange: range, actualGlyphRange: std::ptr::null_mut::<NSRange>()];
-            let hidden: NSRange =
+            let mut hidden: NSRange =
                 msg_send![layout, truncatedGlyphRangeInLineFragmentForGlyphAtIndex: cursor];
-            let hidden = if hidden.length > 0 {
+            if hidden.length == 0 {
+                hidden = oracle_replacement_range(layout, range).unwrap_or(hidden);
+            }
+            let hidden = if mode == ParagraphEllipsize::Clip && limit > 0 {
+                let visible = clipped_cluster_range(layout, container, range, fragment);
+                if visible.location > source.location {
+                    NSRange::new(source.location, visible.location - source.location)
+                } else {
+                    NSRange::new(
+                        visible.location + visible.length,
+                        source.location + source.length - visible.location - visible.length,
+                    )
+                }
+            } else if hidden.length > 0 {
                 msg_send![layout, characterRangeForGlyphRange: hidden, actualGlyphRange: std::ptr::null_mut::<NSRange>()]
             } else {
                 NSRange::new(source.location + source.length, 0)
@@ -253,9 +361,14 @@ fn compare(fixture: Fixture<'_>) -> Result<()> {
         }
         let carets = &line.carets.as_ref().ok_or("missing carets")?.primary;
         assert_eq!(
-            carets.len(), expected.carets.len(),
+            carets.len(),
+            expected.carets.len(),
             "{:?} {} source {:?} hidden {:?} visible {:?}",
-            fixture.mode, fixture.lines, line.source, expected.hidden, line.visible_source
+            fixture.mode,
+            fixture.lines,
+            line.source,
+            expected.hidden,
+            line.visible_source
         );
         for (actual, (index, x)) in carets.iter().zip(expected.carets) {
             assert_eq!(utf16(text, actual.index), index);
@@ -372,6 +485,273 @@ fn attributed_requests_preserve_metric_boundaries_and_plain_requests_still_coale
             .find(|glyph| glyph.glyph.index == index)
             .ok_or("source glyph missing")?;
         assert!((f32::from(glyph.font_size) - expected).abs() < 0.001);
+    }
+    Ok(())
+}
+
+fn mixed_weight_layout(
+    text: &str,
+    mode: ParagraphEllipsize,
+    width: f32,
+) -> Result<gpui::ParagraphGeometry> {
+    let system = system()?;
+    let mut normal = gpui::font("Geist");
+    normal.features = gpui::FontFeatures(Arc::new(vec![
+        ("ss03".into(), 0),
+        ("ss05".into(), 1),
+        ("ss09".into(), 1),
+    ]));
+    let mut strong = normal.clone();
+    strong.weight = gpui::FontWeight::MEDIUM;
+    let runs = [
+        TextRun {
+            len: 4,
+            font: strong,
+            ..Default::default()
+        },
+        TextRun {
+            len: text.len() - 4,
+            font: normal,
+            ..Default::default()
+        },
+    ];
+    let request = system
+        .attributed_paragraph_request(
+            text,
+            px(20.),
+            &runs,
+            ParagraphWidth::Bounded(px(width)),
+            ParagraphDirection::Natural,
+        )?
+        .with_font_sizes(vec![px(20.), px(20.)])?
+        .with_baseline_offsets(vec![px(0.), px(0.)])?
+        .with_paragraph_styles(vec![ParagraphStyleSpan {
+            source: 0..text.len(),
+            direction: ParagraphDirection::Natural,
+            alignment: ParagraphAlignment::Natural,
+            line_height: ParagraphLineHeight::Exact(px(30.)),
+            first_line_indent: px(0.),
+            head_indent: px(0.),
+            tail_indent: px(0.),
+            space_before: px(0.),
+            space_after: px(0.),
+        }])?
+        .with_line_limit(ParagraphLineLimit {
+            max_lines: NonZeroUsize::new(1).ok_or("one line")?,
+            mode,
+        });
+    match system.layout_paragraph(request)? {
+        ParagraphLayout::LaidOut(geometry) => Ok(geometry),
+        ParagraphLayout::Unsupported => Err("native layout unavailable".into()),
+    }
+}
+
+#[test]
+fn mixed_weight_truncation_retains_only_visible_source_and_native_replacements() -> Result<()> {
+    for mode in [
+        ParagraphEllipsize::Head,
+        ParagraphEllipsize::Middle,
+        ParagraphEllipsize::Tail,
+        ParagraphEllipsize::Clip,
+    ] {
+        let geometry = mixed_weight_layout("AAAA bbbb cccc dddd eeee ffff GGGG", mode, 100.)
+            .map_err(|error| format!("{mode:?}: {error}"))?;
+        assert!(geometry.truncated, "{mode:?}: {geometry:?}");
+        assert_eq!(geometry.lines.len(), 1);
+        let line = &geometry.lines[0];
+        assert_eq!(line.source, 0..34);
+        let visible = &line.visible_source;
+        if mode == ParagraphEllipsize::Clip {
+            assert_eq!(visible, &[0..9]);
+        }
+        assert!(!visible.is_empty());
+        assert!(visible.iter().map(std::ops::Range::len).sum::<usize>() < 34);
+        let replacement = line
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.origin == ParagraphGlyphOrigin::Ellipsis);
+        assert_eq!(replacement, mode != ParagraphEllipsize::Clip);
+        assert!(
+            line.glyphs
+                .iter()
+                .filter(|glyph| glyph.origin == ParagraphGlyphOrigin::Source)
+                .all(|glyph| visible
+                    .iter()
+                    .any(|range| range.contains(&glyph.glyph.index)))
+        );
+        assert!(
+            line.carets
+                .as_ref()
+                .ok_or("carets")?
+                .primary
+                .iter()
+                .all(|caret| visible
+                    .iter()
+                    .any(|range| range.start <= caret.index && caret.index <= range.end))
+        );
+        match mode {
+            ParagraphEllipsize::Head => {
+                assert!(visible[0].start > 0);
+                assert_eq!(visible.last().ok_or("suffix")?.end, 34);
+            }
+            ParagraphEllipsize::Middle => {
+                assert_eq!(visible[0].start, 0);
+                assert_eq!(visible.last().ok_or("suffix")?.end, 34);
+            }
+            ParagraphEllipsize::Tail | ParagraphEllipsize::Clip => {
+                assert_eq!(visible[0].start, 0);
+                assert!(visible.last().ok_or("prefix")?.end < 34);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn existing_control_and_ligature_glyph_slots_do_not_become_truncation() -> Result<()> {
+    for mode in [
+        ParagraphEllipsize::Head,
+        ParagraphEllipsize::Middle,
+        ParagraphEllipsize::Tail,
+        ParagraphEllipsize::Clip,
+    ] {
+        let geometry = mixed_weight_layout("AAAA office \u{200e}", mode, 500.)?;
+        assert!(!geometry.truncated, "{mode:?}: {geometry:?}");
+        assert_eq!(geometry.lines.len(), 1);
+        assert_eq!(geometry.lines[0].source, 0..15);
+        assert_eq!(geometry.lines[0].visible_source, [0..15]);
+        assert!(
+            geometry.lines[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.origin == ParagraphGlyphOrigin::Source)
+        );
+        let carets = &geometry.lines[0].carets.as_ref().ok_or("carets")?.primary;
+        assert!(carets.iter().any(|caret| caret.index == 12));
+        assert!(carets.iter().any(|caret| caret.index == 15));
+        let literal = mixed_weight_layout("AAAA …\u{200e}", mode, 500.)?;
+        assert!(!literal.truncated, "{mode:?}: {literal:?}");
+        assert_eq!(literal.lines[0].visible_source, [0..11]);
+        assert!(
+            literal.lines[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.origin == ParagraphGlyphOrigin::Source)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn literal_ellipsis_at_truncated_source_start_does_not_hide_omitted_content() -> Result<()> {
+    let geometry = mixed_weight_layout(
+        "… ordinary words exceed the viewport and end GGGG",
+        ParagraphEllipsize::Head,
+        100.,
+    )?;
+    assert!(geometry.truncated, "{geometry:?}");
+    assert_eq!(geometry.lines.len(), 1);
+    assert!(geometry.lines[0].visible_source[0].start > 0);
+    assert!(
+        geometry.lines[0]
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.origin == ParagraphGlyphOrigin::Ellipsis)
+    );
+    Ok(())
+}
+
+fn clipped_bounds_oracle(text: &str, direction: isize) -> NSRange {
+    // SAFETY: All objects are retained on this thread; AppKit owns its fitted glyph
+    // geometry, and the character-range result is copied before releasing them.
+    unsafe {
+        let source = NSString::from_str(text);
+        let storage: Allocated<AnyObject> = msg_send![class!(NSTextStorage), alloc];
+        let storage: Retained<AnyObject> = msg_send![storage, initWithString: &*source];
+        let font: Retained<AnyObject> = msg_send![class!(NSFont), systemFontOfSize: 20_f64];
+        let style: Retained<AnyObject> = msg_send![class!(NSMutableParagraphStyle), new];
+        let _: () = msg_send![&*style, setBaseWritingDirection: direction];
+        let _: () = msg_send![&*style, setAlignment: 4_isize];
+        let font_key = NSString::from_str("NSFont");
+        let style_key = NSString::from_str("NSParagraphStyle");
+        let range = NSRange::new(0, text.encode_utf16().count());
+        let _: () = msg_send![&*storage, addAttribute: &*font_key, value: &*font, range: range];
+        let _: () = msg_send![&*storage, addAttribute: &*style_key, value: &*style, range: range];
+        let layout: Retained<AnyObject> = msg_send![class!(NSLayoutManager), new];
+        let _: () = msg_send![&*layout, setBackgroundLayoutEnabled: Bool::NO];
+        let _: () = msg_send![&*layout, setAllowsNonContiguousLayout: Bool::NO];
+        let _: () = msg_send![&*layout, setUsesFontLeading: Bool::NO];
+        let container: Allocated<AnyObject> = msg_send![class!(NSTextContainer), alloc];
+        let container: Retained<AnyObject> =
+            msg_send![container, initWithContainerSize: NSSize::new(100., f64::MAX)];
+        let _: () = msg_send![&*container, setLineFragmentPadding: 0_f64];
+        let _: () = msg_send![&*container, setLineBreakMode: 2_usize];
+        let _: () = msg_send![&*container, setMaximumNumberOfLines: 1_usize];
+        let _: () = msg_send![&*layout, addTextContainer: &*container];
+        let _: () = msg_send![&*storage, addLayoutManager: &*layout];
+        let _: () = msg_send![&*layout, ensureLayoutForTextContainer: &*container];
+        let fragment: NSRect = msg_send![&*layout, lineFragmentRectForGlyphAtIndex: 0_usize, effectiveRange: std::ptr::null_mut::<NSRange>(), withoutAdditionalLayout: Bool::YES];
+        let glyphs: NSRange = msg_send![&*layout, glyphRangeForTextContainer: &*container];
+        clipped_cluster_range(&layout, &container, glyphs, fragment)
+    }
+}
+
+#[test]
+fn clipped_ltr_and_rtl_source_coverage_matches_native_container_intersection() -> Result<()> {
+    let system = system()?;
+    for (text, direction, native_direction) in [
+        (
+            "AAAA bbbb cccc dddd eeee ffff GGGG",
+            ParagraphDirection::LeftToRight,
+            0_isize,
+        ),
+        ("אבגדהוזחטיכלמנסעפצקרשת", ParagraphDirection::RightToLeft, 1),
+    ] {
+        let runs = [TextRun {
+            len: text.len(),
+            ..Default::default()
+        }];
+        let request = system
+            .attributed_paragraph_request(
+                text,
+                px(20.),
+                &runs,
+                ParagraphWidth::Bounded(px(100.)),
+                direction,
+            )?
+            .with_line_limit(ParagraphLineLimit {
+                max_lines: NonZeroUsize::new(1).ok_or("one line")?,
+                mode: ParagraphEllipsize::Clip,
+            });
+        let ParagraphLayout::LaidOut(geometry) = system.layout_paragraph(request)? else {
+            return Err("native layout".into());
+        };
+        assert!(geometry.truncated, "{direction:?}: {geometry:?}");
+        let expected = clipped_bounds_oracle(text, native_direction);
+        assert_eq!(geometry.lines[0].visible_source.len(), 1);
+        let visible = &geometry.lines[0].visible_source[0];
+        assert_eq!(utf16(text, visible.start), expected.location);
+        assert_eq!(
+            utf16(text, visible.end),
+            expected.location + expected.length
+        );
+        assert!(visible.len() < text.len());
+        assert!(
+            geometry.lines[0]
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.origin == ParagraphGlyphOrigin::Source
+                    && visible.contains(&glyph.glyph.index))
+        );
+        assert!(
+            geometry.lines[0]
+                .carets
+                .as_ref()
+                .ok_or("carets")?
+                .primary
+                .iter()
+                .all(|caret| visible.start <= caret.index && caret.index <= visible.end)
+        );
     }
     Ok(())
 }

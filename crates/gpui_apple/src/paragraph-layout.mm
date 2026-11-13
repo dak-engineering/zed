@@ -401,7 +401,115 @@ bool captureTruncated(GPUITextKitCapture *layout, NSRange row, NSRange hidden,
     return true;
 }
 
-bool captureRows(GPUITextKitCapture *layout, NSTextContainer *container, const GPUITextKitOptions &options, GPUITextKitLayout *output) {
+bool nativeEllipsisAt(GPUITextKitCapture *layout, NSUInteger index, NSPoint origin,
+    const GPUITextKitLayout &output) {
+    CGGlyph identifier = [layout CGGlyphAtIndex:index];
+    NSPoint location = [layout locationForGlyphAtIndex:index];
+    for (const auto &glyph : output.glyphs) {
+        if (glyph.glyph != identifier || glyph.position[0] != location.x + origin.x
+            || glyph.position[1] != location.y + origin.y) continue;
+        UniChar character = 0x2026;
+        CGGlyph replacement = 0;
+        if (CTFontGetGlyphsForCharacters(output.runs[glyph.run].font, &character, &replacement, 1)
+            && replacement == identifier) return true;
+    }
+    return false;
+}
+
+bool visibleSourceInNullSpan(GPUITextKitCapture *layout, NSRange glyphs) {
+    NSRange source = [layout characterRangeForGlyphRange:glyphs actualGlyphRange:nullptr];
+    NSCharacterSet *controls = NSCharacterSet.controlCharacterSet;
+    for (NSUInteger index = source.location; index < NSMaxRange(source); ++index) {
+        if (![controls characterIsMember:[layout.textStorage.string characterAtIndex:index]]) return true;
+    }
+    return false;
+}
+
+bool omittedWithoutNativeRange(GPUITextKitCapture *layout, NSRange row, NSPoint origin,
+    const GPUITextKitLayout &output, NSRange &hidden) {
+    for (NSUInteger index = row.location; index < NSMaxRange(row);) {
+        if (!([layout propertyForGlyphAtIndex:index] & NSGlyphPropertyNull)
+            || ![layout notShownAttributeForGlyphAtIndex:index]) { ++index; continue; }
+        NSUInteger start = index++;
+        while (index < NSMaxRange(row) && ([layout propertyForGlyphAtIndex:index] & NSGlyphPropertyNull)
+            && [layout notShownAttributeForGlyphAtIndex:index]) ++index;
+        if (!visibleSourceInNullSpan(layout, NSMakeRange(start, index - start))) continue;
+        NSUInteger replacement = NSNotFound;
+        for (NSUInteger candidate : {start > row.location ? start - 1 : NSNotFound,
+            index < NSMaxRange(row) ? index : NSNotFound}) {
+            if (candidate == NSNotFound || [layout notShownAttributeForGlyphAtIndex:candidate]
+                || !nativeEllipsisAt(layout, candidate, origin, output)) continue;
+            if (replacement != NSNotFound) return false;
+            replacement = candidate;
+        }
+        if (replacement == NSNotFound) continue;
+        if (hidden.location != NSNotFound) return false;
+        NSUInteger first = std::min(start, replacement);
+        hidden = NSMakeRange(first, std::max(index, replacement + 1) - first);
+    }
+    return true;
+}
+
+void clippedSource(GPUITextKitCapture *layout, NSTextContainer *container, NSRange row,
+    NSRange source, NSRect fragment, NSRect used, GPUITextKitLayout &output) {
+    if (used.size.width < fragment.size.width) {
+        output.visible.push_back({source.location, source.length});
+        return;
+    }
+    NSRange candidates = NSIntersectionRange(row,
+        [layout glyphRangeForBoundingRect:fragment inTextContainer:container]);
+    for (NSUInteger index = candidates.location; index < NSMaxRange(candidates);) {
+        NSRange cluster;
+        NSRange characters = [layout characterRangeForGlyphRange:NSMakeRange(index, 1) actualGlyphRange:&cluster];
+        cluster = NSIntersectionRange(row, cluster);
+        NSRect bounds = [layout boundingRectForGlyphRange:cluster inTextContainer:container];
+        if (NSIntersectsRect(fragment, bounds)) {
+            characters = NSIntersectionRange(source, characters);
+            NSCharacterSet *controls = NSCharacterSet.controlCharacterSet;
+            while (characters.location > source.location
+                && [controls characterIsMember:[layout.textStorage.string characterAtIndex:characters.location - 1]]) {
+                --characters.location;
+                ++characters.length;
+            }
+            while (NSMaxRange(characters) < NSMaxRange(source)
+                && [controls characterIsMember:[layout.textStorage.string characterAtIndex:NSMaxRange(characters)]])
+                ++characters.length;
+            if (characters.length) output.visible.push_back({characters.location, characters.length});
+        }
+        index = std::max(index + 1, NSMaxRange(cluster));
+    }
+    std::sort(output.visible.begin(), output.visible.end(), [](const auto &left, const auto &right) {
+        return left.start < right.start;
+    });
+    size_t merged = 0;
+    for (const auto &range : output.visible) {
+        if (merged && range.start <= output.visible[merged - 1].start + output.visible[merged - 1].length) {
+            auto &last = output.visible[merged - 1];
+            last.length = std::max(last.start + last.length, range.start + range.length) - last.start;
+        } else output.visible[merged++] = range;
+    }
+    output.visible.resize(merged);
+    if (output.visible.size() != 1 || output.visible[0].start != source.location
+        || output.visible[0].length != source.length) output.truncated = true;
+}
+
+void filterClippedDrawing(NSRect fragment, GPUITextKitLayout &output) {
+    auto visible = [&](size_t index) {
+        for (const auto &range : output.visible)
+            if (range.start <= index && index < range.start + range.length) return true;
+        return false;
+    };
+    output.glyphs.erase(std::remove_if(output.glyphs.begin(), output.glyphs.end(),
+        [&](const auto &glyph) { return !visible(glyph.source); }), output.glyphs.end());
+    output.attachments.erase(std::remove_if(output.attachments.begin(), output.attachments.end(),
+        [&](const auto &object) {
+            NSRect bounds = NSMakeRect(object.bounds[0], object.bounds[1], object.bounds[2], object.bounds[3]);
+            return !visible(object.start) || !NSIntersectsRect(fragment, bounds);
+        }), output.attachments.end());
+}
+
+bool captureRows(GPUITextKitCapture *layout, NSTextContainer *container, const GPUITextKitOptions &options,
+    GPUITextKitLayout *output) {
     const auto &wanted = options.carets;
     CaretPositions carets;
     CGColorSpaceRef color = CGColorSpaceCreateDeviceRGB();
@@ -424,7 +532,24 @@ bool captureRows(GPUITextKitCapture *layout, NSTextContainer *container, const G
                 {fragment.origin.x, fragment.origin.y, fragment.size.width, fragment.size.height}, 0, 0, false, 0};
             NSRange hidden = options.maxLines
                 ? [layout truncatedGlyphRangeInLineFragmentForGlyphAtIndex:cursor] : NSMakeRange(NSNotFound, 0);
-            if (hidden.location != NSNotFound && hidden.length) {
+            NSParagraphStyle *resolved = [layout.textStorage attribute:NSParagraphStyleAttributeName
+                atIndex:sourceRange.location effectiveRange:nullptr];
+            output->line.base_direction = resolved.baseWritingDirection == NSWritingDirectionLeftToRight ? 1
+                : resolved.baseWritingDirection == NSWritingDirectionRightToLeft ? 2 : 0;
+            output->line.carets_available = wantsCarets(wanted, sourceRange.location, sourceRange.length);
+            if (output->line.carets_available
+                && !carets.append(layout, output->line, fragment.origin.x, output->carets)) return false;
+            slots.append(layout, range, fragment.origin, *output);
+            if (!slots.valid) return false;
+            output->glyphs.reserve(range.length);
+            layout.sourceGlyph = NSNotFound;
+            [layout drawGlyphsForGlyphRange:range atPoint:NSZeroPoint];
+            if (options.maxLines && options.ellipsize != GPUITextKitEllipsize::Clip
+                && hidden.location == NSNotFound
+                && !omittedWithoutNativeRange(layout, range, fragment.origin, *output, hidden)) return false;
+            if (options.maxLines && options.ellipsize == GPUITextKitEllipsize::Clip) {
+                clippedSource(layout, container, range, sourceRange, fragment, used, *output);
+            } else if (hidden.location != NSNotFound && hidden.length) {
                 NSRange missing = [layout characterRangeForGlyphRange:hidden actualGlyphRange:nullptr];
                 if (missing.location > sourceRange.location)
                     output->visible.push_back({sourceRange.location, missing.location - sourceRange.location});
@@ -434,19 +559,7 @@ bool captureRows(GPUITextKitCapture *layout, NSTextContainer *container, const G
             } else {
                 output->visible.push_back({sourceRange.location, sourceRange.length});
             }
-            NSParagraphStyle *resolved = [layout.textStorage attribute:NSParagraphStyleAttributeName
-                atIndex:sourceRange.location effectiveRange:nullptr];
-            output->line.base_direction = resolved.baseWritingDirection == NSWritingDirectionLeftToRight ? 1
-                : resolved.baseWritingDirection == NSWritingDirectionRightToLeft ? 2 : 0;
-            output->line.carets_available = wantsCarets(wanted, sourceRange.location, sourceRange.length);
-            if (output->line.carets_available
-                && !carets.append(layout, output->line, fragment.origin.x, output->carets)) return false;
             if (options.maxLines) filterCarets(*output);
-            slots.append(layout, range, fragment.origin, *output);
-            if (!slots.valid) return false;
-            output->glyphs.reserve(range.length);
-            layout.sourceGlyph = NSNotFound;
-            [layout drawGlyphsForGlyphRange:range atPoint:NSZeroPoint];
             if (hidden.location != NSNotFound && hidden.length) {
                 if (!captureTruncated(layout, range, hidden, *output, options)) return false;
             } else if (!slots.assign(output)) {
@@ -458,6 +571,8 @@ bool captureRows(GPUITextKitCapture *layout, NSTextContainer *container, const G
                     [layout drawGlyphsForGlyphRange:NSMakeRange(index, 1) atPoint:NSZeroPoint];
                 }
             }
+            if (options.maxLines && options.ellipsize == GPUITextKitEllipsize::Clip)
+                filterClippedDrawing(fragment, *output);
             if (!layout.valid || !output->emit(&options)) return false;
             cursor = NSMaxRange(range);
             if (options.maxLines && output->emitted >= options.maxLines) {
