@@ -8,10 +8,11 @@ use collections::HashMap;
 use core_foundation::base::TCFType;
 use core_text::font::{CTFont, CTFontRef};
 use gpui::{
-    Bounds, FontId, GlyphId, ParagraphAlignment, ParagraphBidiRun, ParagraphCaret,
-    ParagraphCaretCoverage, ParagraphCarets, ParagraphDirection, ParagraphGeometry, ParagraphGlyph,
-    ParagraphLine, ParagraphLineHeight, ParagraphRequest, ParagraphWidth, Pixels,
-    ResolvedParagraphDirection, ShapedGlyph, point, px, size,
+    Bounds, FontId, GlyphId, ParagraphAlignment, ParagraphAttachmentGeometry, ParagraphBidiRun,
+    ParagraphCaret, ParagraphCaretCoverage, ParagraphCarets, ParagraphDirection,
+    ParagraphEllipsize, ParagraphGeometry, ParagraphGlyph, ParagraphGlyphOrigin, ParagraphLine,
+    ParagraphLineHeight, ParagraphRequest, ParagraphWidth, Pixels, ResolvedParagraphDirection,
+    ShapedGlyph, point, px, size,
 };
 use std::{ffi::c_void, ops::Range, ptr::NonNull};
 
@@ -31,6 +32,7 @@ struct NativeFontRun {
     start: usize,
     length: usize,
     font: CTFontRef,
+    baseline_offset: f64,
 }
 
 #[repr(C)]
@@ -42,6 +44,7 @@ struct NativeLine {
     primary_count: usize,
     alternate_count: usize,
     carets_available: bool,
+    base_direction: u8,
 }
 
 #[repr(C)]
@@ -63,6 +66,7 @@ struct NativeGlyph {
     glyph: u32,
     run: usize,
     position: [f64; 2],
+    synthetic: bool,
 }
 
 #[repr(C)]
@@ -91,6 +95,12 @@ struct NativeOptions {
     carets: NativeCaretRequest,
     line_height: NativeLineHeight,
     alignment: u8,
+    paragraphs: *const NativeParagraphSpan,
+    paragraph_count: usize,
+    attachments: *const NativeAttachment,
+    attachment_count: usize,
+    max_lines: usize,
+    ellipsize: u8,
 }
 
 impl NativeOptions {
@@ -105,15 +115,130 @@ impl NativeOptions {
             emit: receive::<F>,
             carets: NativeCaretRequest::from_request(request),
             line_height: request.line_height().into(),
-            alignment: match request.alignment() {
-                ParagraphAlignment::Natural => 0,
-                ParagraphAlignment::Left => 1,
-                ParagraphAlignment::Center => 2,
-                ParagraphAlignment::Right => 3,
-                ParagraphAlignment::Justified => 4,
-            },
+            alignment: alignment(request.alignment()),
+            paragraphs: std::ptr::null(),
+            paragraph_count: 0,
+            attachments: std::ptr::null(),
+            attachment_count: 0,
+            max_lines: request
+                .line_limit()
+                .map_or(0, |limit| limit.max_lines.get()),
+            ellipsize: request.line_limit().map_or(2, |limit| match limit.mode {
+                ParagraphEllipsize::Head => 0,
+                ParagraphEllipsize::Middle => 1,
+                ParagraphEllipsize::Tail => 2,
+                ParagraphEllipsize::Clip => 3,
+            }),
         }
     }
+}
+
+#[repr(C)]
+struct NativeParagraphSpan {
+    start: usize,
+    length: usize,
+    direction: u8,
+    alignment: u8,
+    line_height: NativeLineHeight,
+    first_line_indent: f64,
+    head_indent: f64,
+    tail_indent: f64,
+    space_before: f64,
+    space_after: f64,
+}
+#[repr(C)]
+struct NativeAttachment {
+    start: usize,
+    length: usize,
+    width: f64,
+    height: f64,
+    baseline_offset: f64,
+}
+#[repr(C)]
+struct NativeAttachmentRect {
+    start: usize,
+    length: usize,
+    bounds: [f64; 4],
+}
+
+fn alignment(value: ParagraphAlignment) -> u8 {
+    match value {
+        ParagraphAlignment::Natural => 0,
+        ParagraphAlignment::Left => 1,
+        ParagraphAlignment::Center => 2,
+        ParagraphAlignment::Right => 3,
+        ParagraphAlignment::Justified => 4,
+    }
+}
+fn direction(value: ParagraphDirection) -> u8 {
+    match value {
+        ParagraphDirection::Natural => 0,
+        ParagraphDirection::LeftToRight => 1,
+        ParagraphDirection::RightToLeft => 2,
+    }
+}
+
+fn document_options(
+    request: &ParagraphRequest<'_>,
+) -> anyhow::Result<(Vec<NativeParagraphSpan>, Vec<NativeAttachment>)> {
+    let mut utf16 = 0;
+    let mut boundaries = Vec::new();
+    let ascii = request.text().is_ascii();
+    if !ascii {
+        for (byte, character) in request.text().char_indices() {
+            boundaries.push((byte, utf16));
+            utf16 += character.len_utf16();
+        }
+        boundaries.push((request.text().len(), utf16));
+    }
+    let offset = |index| -> anyhow::Result<usize> {
+        if ascii {
+            ensure!(
+                index <= request.text().len(),
+                "document offset exceeds source"
+            );
+            Ok(index)
+        } else {
+            let at = boundaries
+                .binary_search_by_key(&index, |(byte, _)| *byte)
+                .map_err(|_| anyhow::anyhow!("document offset splits a source scalar"))?;
+            Ok(boundaries[at].1)
+        }
+    };
+    let paragraphs = request
+        .paragraph_styles()
+        .iter()
+        .map(|span| {
+            let start = offset(span.source.start)?;
+            Ok(NativeParagraphSpan {
+                start,
+                length: offset(span.source.end)? - start,
+                direction: direction(span.direction),
+                alignment: alignment(span.alignment),
+                line_height: span.line_height.into(),
+                first_line_indent: span.first_line_indent.into(),
+                head_indent: span.head_indent.into(),
+                tail_indent: span.tail_indent.into(),
+                space_before: span.space_before.into(),
+                space_after: span.space_after.into(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let attachments = request
+        .attachments()
+        .iter()
+        .map(|object| {
+            let start = offset(object.source.start)?;
+            Ok(NativeAttachment {
+                start,
+                length: offset(object.source.end)? - start,
+                width: object.size.width.into(),
+                height: object.size.height.into(),
+                baseline_offset: object.baseline_offset.into(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((paragraphs, attachments))
 }
 
 #[repr(C)]
@@ -177,6 +302,7 @@ struct Receiver<F> {
     carets: ParagraphCaretCoverage,
     direction: ParagraphDirection,
     lines: Vec<ParagraphLine>,
+    attachments: Vec<ParagraphAttachmentGeometry>,
     fonts: HashMap<CTFontRef, CachedFont>,
     register: F,
 }
@@ -209,6 +335,7 @@ impl<F: FnMut(CTFont) -> (FontId, bool)> Receiver<F> {
             &mut self.fonts,
             &mut self.register,
         )?;
+        self.attachments.extend(source_attachments(native, &byte)?);
         self.lines.push(line);
         Ok(())
     }
@@ -249,6 +376,15 @@ unsafe extern "C" {
         layout: *const NativeLayout,
         count: *mut usize,
     ) -> *const NativeBidiRun;
+    fn gpui_textkit_visible_source(
+        layout: *const NativeLayout,
+        count: *mut usize,
+    ) -> *const NativeSelection;
+    fn gpui_textkit_attachments(
+        layout: *const NativeLayout,
+        count: *mut usize,
+    ) -> *const NativeAttachmentRect;
+    fn gpui_textkit_truncated(layout: *const NativeLayout) -> bool;
     fn gpui_textkit_carets(layout: *const NativeLayout, count: *mut usize) -> *const NativeCaret;
 }
 
@@ -276,7 +412,7 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
     let mut consumed = 0usize;
     let mut utf16_start = 0usize;
     let mut runs = Vec::with_capacity(fonts.len());
-    for (length, font) in fonts {
+    for (index, (length, font)) in fonts.iter().enumerate() {
         let end = consumed.checked_add(*length).context("font run overflow")?;
         let segment = text
             .get(consumed..end)
@@ -286,6 +422,11 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
             start: utf16_start,
             length: utf16_length,
             font: font.as_concrete_TypeRef(),
+            baseline_offset: request
+                .baseline_offsets()
+                .and_then(|offsets| offsets.get(index))
+                .copied()
+                .map_or(0., f64::from),
         });
         consumed = end;
         utf16_start += utf16_length;
@@ -309,11 +450,17 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
         carets: request.carets().clone(),
         direction: request.direction(),
         lines: Vec::new(),
+        attachments: Vec::new(),
         fonts: HashMap::default(),
         register,
     };
     let mut boundary = CallbackBoundary::<_, anyhow::Error>::new(receiver);
-    let options = NativeOptions::new(request, selected.as_ref(), &mut boundary);
+    let (paragraphs, attachments) = document_options(request)?;
+    let mut options = NativeOptions::new(request, selected.as_ref(), &mut boundary);
+    options.paragraphs = paragraphs.as_ptr();
+    options.paragraph_count = paragraphs.len();
+    options.attachments = attachments.as_ptr();
+    options.attachment_count = attachments.len();
     // SAFETY: Input slices/fonts/options outlive this synchronous call. Each row is decoded
     // before native buffers are reused. Panics are held until after C++ returns and cleans up.
     let native = unsafe {
@@ -336,10 +483,11 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
     let native = native.context("native paragraph layout failed")?;
     ensure!(!receiver.lines.is_empty(), "native layout emitted no rows");
     ensure!(
-        receiver
-            .lines
-            .last()
-            .is_some_and(|line| line.source.end == text.len()),
+        request.line_limit().is_some()
+            || receiver
+                .lines
+                .last()
+                .is_some_and(|line| line.source.end == text.len()),
         "native layout dropped source text"
     );
     // SAFETY: The native result owns its copied selection rectangles until native drops.
@@ -347,6 +495,9 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
     Ok(ParagraphGeometry {
         lines: receiver.lines,
         selection_rects: selection_rects(view)?,
+        attachments: receiver.attachments,
+        // SAFETY: The native allocation remains owned by native for this synchronous query.
+        truncated: unsafe { gpui_textkit_truncated(view) },
     })
 }
 
@@ -371,7 +522,7 @@ fn source_line(
     length: usize,
     consumed: usize,
     wanted: &ParagraphCaretCoverage,
-    direction: ParagraphDirection,
+    _direction: ParagraphDirection,
     byte: &impl Fn(usize) -> anyhow::Result<usize>,
 ) -> anyhow::Result<ParagraphLine> {
     let carets = native_carets(native)?;
@@ -414,22 +565,34 @@ fn source_line(
     let alternate = carets
         .get(split..end)
         .context("invalid native alternate caret range")?;
+    let visible_source = visible_source(native, byte)?;
+    let retain_visible = |carets: Vec<ParagraphCaret>| {
+        carets
+            .into_iter()
+            .filter(|caret| {
+                visible_source
+                    .iter()
+                    .any(|span| span.start <= caret.index && caret.index <= span.end)
+            })
+            .collect()
+    };
     Ok(ParagraphLine {
-        base_direction: match direction {
-            ParagraphDirection::Natural => None,
-            ParagraphDirection::LeftToRight => Some(ResolvedParagraphDirection::LeftToRight),
-            ParagraphDirection::RightToLeft => Some(ResolvedParagraphDirection::RightToLeft),
+        base_direction: match line.base_direction {
+            1 => Some(ResolvedParagraphDirection::LeftToRight),
+            2 => Some(ResolvedParagraphDirection::RightToLeft),
+            _ => None,
         },
         carets: if line.carets_available {
             Some(ParagraphCarets {
-                primary: source_carets(primary, &source, byte)?,
-                alternate: source_carets(alternate, &source, byte)?,
+                primary: retain_visible(source_carets(primary, &source, byte)?),
+                alternate: retain_visible(source_carets(alternate, &source, byte)?),
             })
         } else {
             None
         },
         bidi_runs: source_bidi_runs(bidi, &source, byte)?,
         source,
+        visible_source,
         bounds: native_bounds(line.bounds)?,
         fragment_bounds: native_bounds(line.fragment)?,
         glyphs: Vec::new(),
@@ -624,6 +787,11 @@ fn shaped_glyphs(
             "non-finite native glyph position"
         );
         line.glyphs.push(ParagraphGlyph {
+            origin: if glyph.synthetic {
+                ParagraphGlyphOrigin::Ellipsis
+            } else {
+                ParagraphGlyphOrigin::Source
+            },
             font_id: run.font_id,
             font_size: run.font_size,
             glyph: ShapedGlyph {
@@ -641,3 +809,61 @@ fn shaped_glyphs(
 #[cfg(test)]
 #[path = "natural-direction-tests.rs"]
 mod natural_direction_tests;
+
+fn visible_source(
+    native: &NativeLayout,
+    byte: &impl Fn(usize) -> anyhow::Result<usize>,
+) -> anyhow::Result<Vec<Range<usize>>> {
+    let mut count = 0;
+    // SAFETY: This getter lends initialized current-row ranges until the callback returns.
+    let pointer = unsafe { gpui_textkit_visible_source(native, &mut count) };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    ensure!(!pointer.is_null(), "missing native visible source");
+    // SAFETY: Native provides exactly count initialized ranges for this synchronous callback.
+    unsafe { std::slice::from_raw_parts(pointer, count) }
+        .iter()
+        .map(|span| {
+            Ok(byte(span.start)?
+                ..byte(
+                    span.start
+                        .checked_add(span.length)
+                        .context("visible source overflow")?,
+                )?)
+        })
+        .collect()
+}
+
+fn source_attachments(
+    native: &NativeLayout,
+    byte: &impl Fn(usize) -> anyhow::Result<usize>,
+) -> anyhow::Result<Vec<ParagraphAttachmentGeometry>> {
+    let mut count = 0;
+    // SAFETY: This getter lends initialized current-row objects until the callback returns.
+    let pointer = unsafe { gpui_textkit_attachments(native, &mut count) };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    ensure!(!pointer.is_null(), "missing native attachment rectangles");
+    // SAFETY: Native provides exactly count initialized objects for this synchronous callback.
+    unsafe { std::slice::from_raw_parts(pointer, count) }
+        .iter()
+        .map(|object| {
+            Ok(ParagraphAttachmentGeometry {
+                source: byte(object.start)?
+                    ..byte(
+                        object
+                            .start
+                            .checked_add(object.length)
+                            .context("attachment source overflow")?,
+                    )?,
+                bounds: native_bounds(object.bounds)?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "document-truncation-tests.rs"]
+mod document_truncation_tests;

@@ -104,7 +104,12 @@ impl AppleTextSystem {
             let state = self.0.read();
             let mut alternate = false;
             let mut fonts = Vec::with_capacity(runs.len());
-            for run in runs {
+            for (index, run) in runs.iter().enumerate() {
+                let font_size = request
+                    .font_sizes()
+                    .and_then(|sizes| sizes.get(index))
+                    .copied()
+                    .unwrap_or(font_size);
                 let font = state
                     .fonts
                     .get(run.font_id.0)

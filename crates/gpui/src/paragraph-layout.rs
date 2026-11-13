@@ -1,6 +1,6 @@
-use crate::{Bounds, FontId, FontRun, Pixels, ShapedGlyph, px};
+use crate::{Bounds, FontId, FontRun, Pixels, ShapedGlyph, Size, px};
 use anyhow::{Context as _, ensure};
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, num::NonZeroUsize, ops::Range};
 
 /// Requested paragraph base direction, including native automatic resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +61,80 @@ pub enum ParagraphAlignment {
     Justified,
 }
 
+/// Replacement policy applied by the native document text container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParagraphEllipsize {
+    /// Keep the end of the final visible native line.
+    Head,
+    /// Keep both ends of the final visible native line.
+    Middle,
+    /// Keep the beginning of the final visible native line.
+    Tail,
+    /// Omit overflowing glyphs without a replacement.
+    Clip,
+}
+
+/// A document-wide maximum number of native visual lines.
+#[derive(Clone, Copy, Debug)]
+pub struct ParagraphLineLimit {
+    /// Positive maximum number of visual lines across all paragraph spans.
+    pub max_lines: NonZeroUsize,
+    /// Native replacement behavior on the final visible line.
+    pub mode: ParagraphEllipsize,
+}
+
+/// A scalar-aligned complete paragraph range and its native presentation.
+#[derive(Clone, Debug)]
+pub struct ParagraphStyleSpan {
+    /// UTF-8 paragraph range, including its terminator when present.
+    pub source: Range<usize>,
+    /// Native base-direction policy.
+    pub direction: ParagraphDirection,
+    /// Native physical alignment.
+    pub alignment: ParagraphAlignment,
+    /// Native line-height policy.
+    pub line_height: ParagraphLineHeight,
+    /// Physical leading indentation of the first line.
+    pub first_line_indent: Pixels,
+    /// Physical leading indentation of subsequent lines.
+    pub head_indent: Pixels,
+    /// Native tail indentation (nonpositive values inset from the trailing edge).
+    pub tail_indent: Pixels,
+    /// Native spacing before the paragraph.
+    pub space_before: Pixels,
+    /// Native spacing after the paragraph.
+    pub space_after: Pixels,
+}
+
+/// An inline object measured by native layout and painted by the caller.
+#[derive(Clone, Debug)]
+pub struct ParagraphAttachment {
+    /// Exactly one U+FFFC in the original UTF-8 source.
+    pub source: Range<usize>,
+    /// Object dimensions in points.
+    pub size: Size<Pixels>,
+    /// Native attachment baseline displacement.
+    pub baseline_offset: Pixels,
+}
+
+/// Native bounds of a visible original-source attachment.
+#[derive(Debug)]
+pub struct ParagraphAttachmentGeometry {
+    /// Original UTF-8 object range.
+    pub source: Range<usize>,
+    /// Final native drawing rectangle.
+    pub bounds: Bounds<Pixels>,
+}
+
+/// Whether a drawing glyph belongs to source or the native truncation replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParagraphGlyphOrigin {
+    /// Original source, addressed by the glyph's UTF-8 index.
+    Source,
+    /// Synthetic native replacement. Its index is a style anchor, not source text.
+    Ellipsis,
+}
+
 /// Which consumed rows need insertion positions from the native layout.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ParagraphCaretCoverage {
@@ -97,6 +171,11 @@ pub struct ParagraphRequest<'source> {
     line_height: ParagraphLineHeight,
     alignment: ParagraphAlignment,
     carets: ParagraphCaretCoverage,
+    font_sizes: Option<Vec<Pixels>>,
+    baseline_offsets: Option<Vec<Pixels>>,
+    paragraph_styles: Vec<ParagraphStyleSpan>,
+    attachments: Vec<ParagraphAttachment>,
+    line_limit: Option<ParagraphLineLimit>,
 }
 
 impl<'source> ParagraphRequest<'source> {
@@ -161,6 +240,11 @@ impl<'source> ParagraphRequest<'source> {
             line_height: ParagraphLineHeight::Natural,
             alignment: ParagraphAlignment::Natural,
             carets: ParagraphCaretCoverage::All,
+            font_sizes: None,
+            baseline_offsets: None,
+            paragraph_styles: Vec::new(),
+            attachments: Vec::new(),
+            line_limit: None,
         })
     }
 
@@ -177,6 +261,144 @@ impl<'source> ParagraphRequest<'source> {
         }
         self.line_height = height;
         Ok(self)
+    }
+
+    /// Overrides each resolved font run's point size without changing source coverage.
+    ///
+    /// # Errors
+    /// Rejects mismatched run counts and nonpositive/nonfinite sizes.
+    pub fn with_font_sizes(mut self, sizes: Vec<Pixels>) -> anyhow::Result<Self> {
+        ensure!(
+            sizes.len() == self.runs.len(),
+            "font size count differs from runs"
+        );
+        ensure!(
+            sizes
+                .iter()
+                .all(|size| f32::from(*size).is_finite() && *size > px(0.)),
+            "invalid run font size"
+        );
+        self.font_sizes = Some(sizes);
+        Ok(self)
+    }
+
+    /// Raises each font run by a finite signed offset in native point coordinates.
+    /// Exact-height centering, when requested, is added to this offset.
+    ///
+    /// # Errors
+    /// Rejects mismatched run counts and nonfinite offsets.
+    pub fn with_baseline_offsets(mut self, offsets: Vec<Pixels>) -> anyhow::Result<Self> {
+        ensure!(
+            offsets.len() == self.runs.len(),
+            "baseline offset count differs from runs"
+        );
+        ensure!(
+            offsets.iter().all(|offset| f32::from(*offset).is_finite()),
+            "invalid run baseline offset"
+        );
+        self.baseline_offsets = Some(offsets);
+        Ok(self)
+    }
+
+    /// Optional native baseline offset for every supplied run.
+    pub fn baseline_offsets(&self) -> Option<&[Pixels]> {
+        self.baseline_offsets.as_deref()
+    }
+
+    /// Applies ordered nonoverlapping complete-paragraph style spans.
+    ///
+    /// # Errors
+    /// Rejects invalid source/paragraph boundaries, overlap, or nonfinite metrics.
+    pub fn with_paragraph_styles(mut self, spans: Vec<ParagraphStyleSpan>) -> anyhow::Result<Self> {
+        let mut end = 0;
+        for span in &spans {
+            ensure!(
+                self.text.get(span.source.clone()).is_some() && span.source.start >= end,
+                "invalid paragraph style range"
+            );
+            ensure!(
+                span.source.start == 0 || self.text[..span.source.start].ends_with('\n'),
+                "style must start at paragraph boundary"
+            );
+            ensure!(
+                span.source.end == self.text.len() || self.text[..span.source.end].ends_with('\n'),
+                "style must end at paragraph boundary"
+            );
+            let metrics = [
+                span.first_line_indent,
+                span.head_indent,
+                span.tail_indent,
+                span.space_before,
+                span.space_after,
+            ];
+            ensure!(
+                metrics.iter().all(|value| f32::from(*value).is_finite()),
+                "nonfinite paragraph metric"
+            );
+            if let ParagraphLineHeight::Exact(value) | ParagraphLineHeight::AtLeast(value) =
+                span.line_height
+            {
+                ensure!(
+                    f32::from(value).is_finite() && value > px(0.),
+                    "invalid span line height"
+                );
+            }
+            end = span.source.end;
+        }
+        self.paragraph_styles = spans;
+        Ok(self)
+    }
+
+    /// Supplies inline metrics at original-source object placeholders.
+    ///
+    /// # Errors
+    /// Rejects overlapping objects, non-placeholder ranges and invalid dimensions.
+    pub fn with_attachments(mut self, objects: Vec<ParagraphAttachment>) -> anyhow::Result<Self> {
+        let mut end = 0;
+        for object in &objects {
+            ensure!(
+                self.text.get(object.source.clone()) == Some("\u{fffc}")
+                    && object.source.start >= end,
+                "invalid attachment source"
+            );
+            let metrics = [
+                object.size.width,
+                object.size.height,
+                object.baseline_offset,
+            ];
+            ensure!(
+                metrics.iter().all(|value| f32::from(*value).is_finite())
+                    && object.size.width >= px(0.)
+                    && object.size.height >= px(0.),
+                "invalid attachment metrics"
+            );
+            end = object.source.end;
+        }
+        self.attachments = objects;
+        Ok(self)
+    }
+
+    /// Limits the complete native document; no limit preserves full source coverage.
+    pub fn with_line_limit(mut self, limit: ParagraphLineLimit) -> Self {
+        self.line_limit = Some(limit);
+        self
+    }
+
+    /// Optional font size for every supplied run.
+    pub fn font_sizes(&self) -> Option<&[Pixels]> {
+        self.font_sizes.as_deref()
+    }
+    /// Ordered complete-paragraph overrides.
+    pub fn paragraph_styles(&self) -> &[ParagraphStyleSpan] {
+        &self.paragraph_styles
+    }
+    /// Original-source inline object measurements.
+    pub fn attachments(&self) -> &[ParagraphAttachment] {
+        &self.attachments
+    }
+    /// Optional document-wide native line limit.
+    pub fn line_limit(&self) -> Option<ParagraphLineLimit> {
+        self.line_limit
     }
 
     /// Chooses native alignment without changing the resolved paragraph base direction.
@@ -276,11 +498,17 @@ pub struct ParagraphGeometry {
     /// Native order and vertical coalescing are preserved, including zero-width rectangles.
     /// No selection or a collapsed selection produces an empty vector.
     pub selection_rects: Vec<Bounds<Pixels>>,
+    /// Visible object rectangles from the same native layout.
+    pub attachments: Vec<ParagraphAttachmentGeometry>,
+    /// True when the native container omitted original source.
+    pub truncated: bool,
 }
 
 /// A final contextual glyph. Positions are in paragraph coordinates, with y increasing downwards.
 #[derive(Debug)]
 pub struct ParagraphGlyph {
+    /// Original source or a synthetic native replacement.
+    pub origin: ParagraphGlyphOrigin,
     /// Registered in the text system that performed layout.
     pub font_id: FontId,
     /// Actual font point size, including any run-boundary adjustment.
@@ -319,6 +547,8 @@ pub struct ParagraphLine {
     pub base_direction: Option<ResolvedParagraphDirection>,
     /// Consumed UTF-8 bytes, including any line terminator. A final empty caret row uses EOF..EOF.
     pub source: Range<usize>,
+    /// Ordered original-source segments that remain visible (replacement glyphs excluded).
+    pub visible_source: Vec<Range<usize>>,
     /// Native used rectangle in paragraph coordinates.
     pub bounds: Bounds<Pixels>,
     /// Full native line fragment in paragraph coordinates, including the fitting width.

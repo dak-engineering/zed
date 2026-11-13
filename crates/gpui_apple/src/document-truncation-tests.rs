@@ -1,0 +1,377 @@
+use crate::AppleTextSystem;
+use gpui::{
+    Font, ParagraphAlignment, ParagraphAttachment, ParagraphDirection, ParagraphEllipsize,
+    ParagraphGlyphOrigin, ParagraphLayout, ParagraphLineHeight, ParagraphLineLimit,
+    ParagraphStyleSpan, ParagraphWidth, PlatformTextSystem as _, TextRun, TextSystem,
+    WindowTextSystem, px, size,
+};
+use objc2::{
+    class, msg_send,
+    rc::{Allocated, Retained},
+    runtime::{AnyObject, Bool},
+};
+use objc2_foundation::{NSRange, NSRect, NSSize, NSString};
+use std::{num::NonZeroUsize, ops::Range, sync::Arc};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+struct OracleLine {
+    source: NSRange,
+    hidden: NSRange,
+    used: NSRect,
+    carets: Vec<(usize, f64)>,
+}
+struct Fixture<'a> {
+    text: &'a str,
+    split: usize,
+    object: Option<usize>,
+    lines: usize,
+    mode: ParagraphEllipsize,
+}
+
+fn system() -> Result<WindowTextSystem> {
+    let backend = Arc::new(AppleTextSystem::new());
+    backend.font_id(&Font::default())?;
+    Ok(WindowTextSystem::new(Arc::new(TextSystem::new(backend))))
+}
+fn utf16(text: &str, index: usize) -> usize {
+    text[..index].encode_utf16().count()
+}
+fn paragraph(source: Range<usize>, height: f32) -> ParagraphStyleSpan {
+    ParagraphStyleSpan {
+        source,
+        direction: ParagraphDirection::LeftToRight,
+        alignment: ParagraphAlignment::Left,
+        line_height: ParagraphLineHeight::AtLeast(px(height)),
+        first_line_indent: px(4.),
+        head_indent: px(2.),
+        tail_indent: px(-3.),
+        space_before: px(0.),
+        space_after: px(2.),
+    }
+}
+
+fn oracle(fixture: &Fixture<'_>) -> Vec<OracleLine> {
+    // SAFETY: All native objects are retained on the calling thread. These public
+    // AppKit selectors and structure encodings are independent of the bridge.
+    unsafe {
+        let text = fixture.text;
+        let source = NSString::from_str(text);
+        let storage: Allocated<AnyObject> = msg_send![class!(NSTextStorage), alloc];
+        let storage: Retained<AnyObject> = msg_send![storage, initWithString: &*source];
+        let font_key = NSString::from_str("NSFont");
+        let paragraph_key = NSString::from_str("NSParagraphStyle");
+        for (range, font_size, height) in [
+            (0..fixture.split, 24_f64, 30_f64),
+            (fixture.split..text.len(), 14., 22.),
+        ] {
+            if range.is_empty() {
+                continue;
+            }
+            let font: Retained<AnyObject> = msg_send![class!(NSFont), systemFontOfSize: font_size];
+            let style: Retained<AnyObject> = msg_send![class!(NSMutableParagraphStyle), new];
+            let _: () = msg_send![&*style, setBaseWritingDirection: 0_isize];
+            let _: () = msg_send![&*style, setAlignment: 0_isize];
+            let _: () = msg_send![&*style, setMinimumLineHeight: height];
+            let _: () = msg_send![&*style, setFirstLineHeadIndent: 4_f64];
+            let _: () = msg_send![&*style, setHeadIndent: 2_f64];
+            let _: () = msg_send![&*style, setTailIndent: -3_f64];
+            let _: () = msg_send![&*style, setParagraphSpacing: 2_f64];
+            let range = NSRange::new(utf16(text, range.start), text[range].encode_utf16().count());
+            let _: () = msg_send![&*storage, addAttribute: &*font_key, value: &*font, range: range];
+            if range.location == 0 && fixture.split > 0 {
+                let key = NSString::from_str("NSBaselineOffset");
+                let offset: Retained<AnyObject> =
+                    msg_send![class!(NSNumber), numberWithDouble: 3_f64];
+                let _: () =
+                    msg_send![&*storage, addAttribute: &*key, value: &*offset, range: range];
+            }
+            let _: () =
+                msg_send![&*storage, addAttribute: &*paragraph_key, value: &*style, range: range];
+        }
+        if let Some(index) = fixture.object {
+            let attachment: Retained<AnyObject> = msg_send![class!(NSTextAttachment), new];
+            let image: Allocated<AnyObject> = msg_send![class!(NSImage), alloc];
+            let image: Retained<AnyObject> = msg_send![image, initWithSize: NSSize::new(20., 28.)];
+            let cell: Allocated<AnyObject> = msg_send![class!(NSTextAttachmentCell), alloc];
+            let cell: Retained<AnyObject> = msg_send![cell, initImageCell: &*image];
+            let _: () = msg_send![&*attachment, setAttachmentCell: &*cell];
+            let _: () = msg_send![&*attachment, setBounds: NSRect::new(objc2_foundation::NSPoint::new(0., 0.), NSSize::new(20., 28.))];
+            let key = NSString::from_str("NSAttachment");
+            let _: () = msg_send![&*storage, addAttribute: &*key, value: &*attachment, range: NSRange::new(utf16(text, index), 1)];
+        }
+        let layout: Retained<AnyObject> = msg_send![class!(NSLayoutManager), new];
+        let _: () = msg_send![&*layout, setBackgroundLayoutEnabled: Bool::NO];
+        let _: () = msg_send![&*layout, setAllowsNonContiguousLayout: Bool::NO];
+        let _: () = msg_send![&*layout, setUsesFontLeading: Bool::NO];
+        let container: Allocated<AnyObject> = msg_send![class!(NSTextContainer), alloc];
+        let container: Retained<AnyObject> =
+            msg_send![container, initWithContainerSize: NSSize::new(120., f64::MAX)];
+        let _: () = msg_send![&*container, setLineFragmentPadding: 0_f64];
+        let _: () = msg_send![&*container, setMaximumNumberOfLines: fixture.lines];
+        let mode = if fixture.lines == 0 {
+            0_usize
+        } else {
+            match fixture.mode {
+                ParagraphEllipsize::Clip => 2,
+                ParagraphEllipsize::Head => 3,
+                ParagraphEllipsize::Tail => 4,
+                ParagraphEllipsize::Middle => 5,
+            }
+        };
+        let _: () = msg_send![&*container, setLineBreakMode: mode];
+        let _: () = msg_send![&*layout, addTextContainer: &*container];
+        let _: () = msg_send![&*storage, addLayoutManager: &*layout];
+        let _: () = msg_send![&*layout, ensureLayoutForTextContainer: &*container];
+        oracle_lines(&layout, &container, fixture.lines)
+    }
+}
+
+fn oracle_lines(layout: &AnyObject, container: &AnyObject, limit: usize) -> Vec<OracleLine> {
+    // SAFETY: The caller retains the fully laid out native object graph. Native
+    // insertion count is queried before allocating its output buffers.
+    unsafe {
+        let allocated: NSRange = msg_send![layout, glyphRangeForTextContainer: container];
+        let mut output = Vec::new();
+        let mut cursor = allocated.location;
+        while cursor < allocated.location + allocated.length && (limit == 0 || output.len() < limit)
+        {
+            let mut range = NSRange::new(0, 0);
+            let fragment: NSRect = msg_send![layout, lineFragmentRectForGlyphAtIndex: cursor, effectiveRange: &mut range, withoutAdditionalLayout: Bool::YES];
+            let used: NSRect = msg_send![layout, lineFragmentUsedRectForGlyphAtIndex: cursor, effectiveRange: std::ptr::null_mut::<NSRange>(), withoutAdditionalLayout: Bool::YES];
+            let source: NSRange = msg_send![layout, characterRangeForGlyphRange: range, actualGlyphRange: std::ptr::null_mut::<NSRange>()];
+            let hidden: NSRange =
+                msg_send![layout, truncatedGlyphRangeInLineFragmentForGlyphAtIndex: cursor];
+            let hidden = if hidden.length > 0 {
+                msg_send![layout, characterRangeForGlyphRange: hidden, actualGlyphRange: std::ptr::null_mut::<NSRange>()]
+            } else {
+                NSRange::new(source.location + source.length, 0)
+            };
+            let count: usize = msg_send![layout, getLineFragmentInsertionPointsForCharacterAtIndex: source.location, alternatePositions: Bool::NO, inDisplayOrder: Bool::YES, positions: std::ptr::null_mut::<f64>(), characterIndexes: std::ptr::null_mut::<usize>()];
+            let mut positions = vec![0_f64; count];
+            let mut indices = vec![0_usize; count];
+            let count: usize = msg_send![layout, getLineFragmentInsertionPointsForCharacterAtIndex: source.location, alternatePositions: Bool::NO, inDisplayOrder: Bool::YES, positions: positions.as_mut_ptr(), characterIndexes: indices.as_mut_ptr()];
+            let carets = indices
+                .into_iter()
+                .zip(positions)
+                .take(count)
+                .filter(|(index, _)| {
+                    hidden.length == 0
+                        || hidden.location > source.location
+                            && (source.location..=hidden.location).contains(index)
+                        || hidden.location + hidden.length < source.location + source.length
+                            && (hidden.location + hidden.length..=source.location + source.length)
+                                .contains(index)
+                })
+                .map(|(index, x)| (index, x + fragment.origin.x))
+                .collect();
+            assert!(range.length > 0);
+            output.push(OracleLine {
+                source,
+                hidden,
+                used,
+                carets,
+            });
+            cursor = range.location + range.length;
+        }
+        output
+    }
+}
+
+fn compare(fixture: Fixture<'_>) -> Result<()> {
+    let system = system()?;
+    let text = fixture.text;
+    let runs = [
+        TextRun {
+            len: fixture.split,
+            ..Default::default()
+        },
+        TextRun {
+            len: text.len() - fixture.split,
+            ..Default::default()
+        },
+    ];
+    let mut request = system
+        .attributed_paragraph_request(
+            text,
+            px(20.),
+            &runs,
+            ParagraphWidth::Bounded(px(120.)),
+            ParagraphDirection::Natural,
+        )?
+        .with_font_sizes(vec![px(24.), px(14.)])?
+        .with_baseline_offsets(vec![px(3.), px(0.)])?
+        .with_paragraph_styles(
+            [
+                paragraph(0..fixture.split, 30.),
+                paragraph(fixture.split..text.len(), 22.),
+            ]
+            .into_iter()
+            .filter(|span| !span.source.is_empty())
+            .collect(),
+        )?
+        .with_selection(0..text.len())?;
+    if let Some(index) = fixture.object {
+        request = request.with_attachments(vec![ParagraphAttachment {
+            source: index..index + '\u{fffc}'.len_utf8(),
+            size: size(px(20.), px(28.)),
+            baseline_offset: px(0.),
+        }])?;
+    }
+    if let Some(max_lines) = NonZeroUsize::new(fixture.lines) {
+        request = request.with_line_limit(ParagraphLineLimit {
+            max_lines,
+            mode: fixture.mode,
+        });
+    }
+    let ParagraphLayout::LaidOut(actual) = system.layout_paragraph(request)? else {
+        return Err("native layout unavailable".into());
+    };
+    let expected = oracle(&fixture);
+    assert_eq!(actual.lines.len(), expected.len());
+    for (line, expected) in actual.lines.iter().zip(expected) {
+        assert_eq!(utf16(text, line.source.start), expected.source.location);
+        assert_eq!(
+            utf16(text, line.source.end),
+            expected.source.location + expected.source.length
+        );
+        for (got, want) in [
+            (line.bounds.left(), expected.used.origin.x),
+            (line.bounds.top(), expected.used.origin.y),
+            (line.bounds.size.width, expected.used.size.width),
+            (line.bounds.size.height, expected.used.size.height),
+        ] {
+            assert!((f64::from(got) - want).abs() < 0.001, "{got:?} != {want}");
+        }
+        for range in &line.visible_source {
+            let start = utf16(text, range.start);
+            let end = utf16(text, range.end);
+            assert!(
+                expected.hidden.length == 0
+                    || end <= expected.hidden.location
+                    || start >= expected.hidden.location + expected.hidden.length
+            );
+        }
+        let carets = &line.carets.as_ref().ok_or("missing carets")?.primary;
+        assert_eq!(
+            carets.len(), expected.carets.len(),
+            "{:?} {} source {:?} hidden {:?} visible {:?}",
+            fixture.mode, fixture.lines, line.source, expected.hidden, line.visible_source
+        );
+        for (actual, (index, x)) in carets.iter().zip(expected.carets) {
+            assert_eq!(utf16(text, actual.index), index);
+            assert!((f64::from(actual.x) - x).abs() < 0.001);
+        }
+        for glyph in &line.glyphs {
+            if glyph.origin == ParagraphGlyphOrigin::Source {
+                assert!(
+                    line.visible_source
+                        .iter()
+                        .any(|range| range.contains(&glyph.glyph.index))
+                );
+            } else {
+                assert!(expected.hidden.length > 0);
+            }
+        }
+    }
+    if fixture.lines == 0 {
+        assert!(!actual.truncated);
+    }
+    if let Some(index) = fixture.object {
+        let object = actual
+            .attachments
+            .iter()
+            .find(|object| object.source.start == index)
+            .ok_or("visible attachment missing")?;
+        assert_eq!(object.source, index..index + 3);
+        assert_eq!(object.bounds.size, size(px(20.), px(28.)));
+    }
+    assert_eq!(text, fixture.text);
+    Ok(())
+}
+
+#[test]
+fn document_line_limit_modes_match_independent_textkit_source_and_carets() -> Result<()> {
+    let text = "ordinary words are longer than this viewport and contain אבג Unicode";
+    for mode in [
+        ParagraphEllipsize::Head,
+        ParagraphEllipsize::Middle,
+        ParagraphEllipsize::Tail,
+        ParagraphEllipsize::Clip,
+    ] {
+        compare(Fixture {
+            text,
+            split: 0,
+            object: None,
+            lines: 1,
+            mode,
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn document_limit_keeps_mixed_fonts_paragraphs_and_attachment_metrics_together() -> Result<()> {
+    let text =
+        "Heading\nsmall \u{fffc} words wrap over several native visual lines after the heading";
+    let object = text.find('\u{fffc}').ok_or("object")?;
+    for lines in [0, 3] {
+        compare(Fixture {
+            text,
+            split: 8,
+            object: Some(object),
+            lines,
+            mode: ParagraphEllipsize::Tail,
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn attributed_requests_preserve_metric_boundaries_and_plain_requests_still_coalesce() -> Result<()>
+{
+    let system = system()?;
+    let runs = [
+        TextRun {
+            len: 1,
+            ..Default::default()
+        },
+        TextRun {
+            len: 1,
+            ..Default::default()
+        },
+    ];
+    let width = ParagraphWidth::Bounded(px(120.));
+    let ordinary =
+        system.paragraph_request("ab", px(20.), &runs, width, ParagraphDirection::LeftToRight)?;
+    assert_eq!(ordinary.runs().len(), 1);
+    let attributed = system
+        .attributed_paragraph_request("ab", px(20.), &runs, width, ParagraphDirection::LeftToRight)?
+        .with_font_sizes(vec![px(12.), px(24.)])?
+        .with_baseline_offsets(vec![px(3.), px(-2.)])?;
+    assert_eq!(
+        attributed
+            .runs()
+            .iter()
+            .map(|run| run.len)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    assert_eq!(attributed.font_sizes(), Some([px(12.), px(24.)].as_slice()));
+    assert_eq!(
+        attributed.baseline_offsets(),
+        Some([px(3.), px(-2.)].as_slice())
+    );
+    let ParagraphLayout::LaidOut(geometry) = system.layout_paragraph(attributed)? else {
+        return Err("native layout unavailable".into());
+    };
+    for (index, expected) in [(0, 12_f32), (1, 24_f32)] {
+        let glyph = geometry
+            .lines
+            .iter()
+            .flat_map(|line| &line.glyphs)
+            .find(|glyph| glyph.glyph.index == index)
+            .ok_or("source glyph missing")?;
+        assert!((f32::from(glyph.font_size) - expected).abs() < 0.001);
+    }
+    Ok(())
+}

@@ -901,6 +901,32 @@ impl WindowTextSystem {
         )
     }
 
+    /// Resolves an attributed document without merging any supplied style-run boundaries.
+    /// Each returned font run corresponds to exactly one input run, allowing per-run
+    /// sizes and baseline offsets to be attached without changing source coordinates.
+    /// The ordinary paragraph constructor retains its existing coalescing behavior.
+    ///
+    /// # Errors
+    /// Rejects invalid sizing, incomplete coverage and non-scalar source boundaries.
+    pub fn attributed_paragraph_request<'source>(
+        &self,
+        text: &'source str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        width: ParagraphWidth,
+        direction: ParagraphDirection,
+    ) -> Result<ParagraphRequest<'source>> {
+        ParagraphRequest::validate(text, font_size, runs.iter().map(|run| run.len), width)?;
+        let fonts = runs
+            .iter()
+            .map(|run| FontRun {
+                len: run.len,
+                font_id: self.resolve_font(&run.font),
+            })
+            .collect();
+        ParagraphRequest::try_from_runs(text, font_size, Cow::Owned(fonts), width, direction)
+    }
+
     fn font_runs(&self, runs: &[TextRun]) -> Vec<FontRun> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_buffer.take();
