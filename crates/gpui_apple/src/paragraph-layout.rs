@@ -8,9 +8,9 @@ use collections::HashMap;
 use core_foundation::base::TCFType;
 use core_text::font::{CTFont, CTFontRef};
 use gpui::{
-    Bounds, FontId, GlyphId, ParagraphBidiRun, ParagraphCaret, ParagraphCaretCoverage,
-    ParagraphCarets, ParagraphGeometry, ParagraphGlyph, ParagraphLine, ParagraphRequest,
-    ParagraphWidth, Pixels, ShapedGlyph, point, px, size,
+    Bounds, FontId, GlyphId, ParagraphAlignment, ParagraphBidiRun, ParagraphCaret,
+    ParagraphCaretCoverage, ParagraphCarets, ParagraphGeometry, ParagraphGlyph, ParagraphLine,
+    ParagraphLineHeight, ParagraphRequest, ParagraphWidth, Pixels, ShapedGlyph, point, px, size,
 };
 use std::{ffi::c_void, ops::Range, ptr::NonNull};
 
@@ -88,6 +88,48 @@ struct NativeOptions {
     context: *mut c_void,
     emit: extern "C" fn(*mut c_void, *const NativeLayout) -> bool,
     carets: NativeCaretRequest,
+    line_height: NativeLineHeight,
+    alignment: u8,
+}
+
+impl NativeOptions {
+    fn new<F: FnMut(CTFont) -> (FontId, bool)>(
+        request: &ParagraphRequest<'_>,
+        selected: Option<&NativeSelection>,
+        boundary: &mut CallbackBoundary<Receiver<F>, anyhow::Error>,
+    ) -> Self {
+        Self {
+            selection: selected.map_or(std::ptr::null(), |value| value),
+            context: std::ptr::from_mut(boundary).cast(),
+            emit: receive::<F>,
+            carets: NativeCaretRequest::from_request(request),
+            line_height: request.line_height().into(),
+            alignment: match request.alignment() {
+                ParagraphAlignment::Natural => 0,
+                ParagraphAlignment::Left => 1,
+                ParagraphAlignment::Center => 2,
+                ParagraphAlignment::Right => 3,
+                ParagraphAlignment::Justified => 4,
+            },
+        }
+    }
+}
+
+#[repr(C)]
+struct NativeLineHeight {
+    mode: u8,
+    height: f64,
+}
+
+impl From<ParagraphLineHeight> for NativeLineHeight {
+    fn from(height: ParagraphLineHeight) -> Self {
+        let (mode, height) = match height {
+            ParagraphLineHeight::Natural => (0, 0.),
+            ParagraphLineHeight::Exact(value) => (1, f64::from(value)),
+            ParagraphLineHeight::AtLeast(value) => (2, f64::from(value)),
+        };
+        Self { mode, height }
+    }
 }
 
 #[repr(C)]
@@ -261,12 +303,7 @@ pub(super) fn layout<F: FnMut(CTFont) -> (FontId, bool)>(
         register,
     };
     let mut boundary = CallbackBoundary::<_, anyhow::Error>::new(receiver);
-    let options = NativeOptions {
-        selection: selected.as_ref().map_or(std::ptr::null(), |value| value),
-        context: std::ptr::from_mut(&mut boundary).cast(),
-        emit: receive::<F>,
-        carets: NativeCaretRequest::from_request(request),
-    };
+    let options = NativeOptions::new(request, selected.as_ref(), &mut boundary);
     // SAFETY: Input slices/fonts/options outlive this synchronous call. Each row is decoded
     // before native buffers are reused. Panics are held until after C++ returns and cleans up.
     let native = unsafe {

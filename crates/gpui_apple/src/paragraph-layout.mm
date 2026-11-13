@@ -145,12 +145,65 @@ public:
     }
 };
 
+NSMutableParagraphStyle *paragraphStyle(bool rtl, const GPUITextKitOptions &options) {
+    const auto &height = options.lineHeight;
+    if (!std::isfinite(height.height)) return nil;
+    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+    style.baseWritingDirection = rtl ? NSWritingDirectionRightToLeft : NSWritingDirectionLeftToRight;
+    style.lineBreakMode = NSLineBreakByWordWrapping;
+    switch (height.mode) {
+        case GPUITextKitLineHeightMode::Natural:
+            if (height.height != 0) return nil;
+            break;
+        case GPUITextKitLineHeightMode::Exact:
+            if (height.height <= 0) return nil;
+            style.maximumLineHeight = height.height;
+            [[fallthrough]];
+        case GPUITextKitLineHeightMode::AtLeast:
+            if (height.height <= 0) return nil;
+            style.minimumLineHeight = height.height;
+            break;
+        default: return nil;
+    }
+    switch (options.alignment) {
+        case GPUITextKitAlignment::Natural: style.alignment = NSTextAlignmentNatural; break;
+        case GPUITextKitAlignment::Left: style.alignment = NSTextAlignmentLeft; break;
+        case GPUITextKitAlignment::Center: style.alignment = NSTextAlignmentCenter; break;
+        case GPUITextKitAlignment::Right: style.alignment = NSTextAlignmentRight; break;
+        case GPUITextKitAlignment::Justified: style.alignment = NSTextAlignmentJustified; break;
+        default: return nil;
+    }
+    return style;
+}
+
+NSMutableAttributedString *configuredSource(const uint16_t *text, size_t length,
+    const GPUITextKitFontRun *runs, size_t count, NSParagraphStyle *style, GPUITextKitLineHeight height) {
+    NSString *source = [[NSString alloc] initWithCharacters:text length:length];
+    NSMutableAttributedString *attributed = [[NSMutableAttributedString alloc] initWithString:source];
+    [attributed addAttribute:NSParagraphStyleAttributeName value:style range:NSMakeRange(0, length)];
+    for (size_t index = 0; index < count; ++index) {
+        const auto &run = runs[index];
+        if (run.start > length || run.length > length - run.start || !run.font) return nil;
+        NSRange range = NSMakeRange(run.start, run.length);
+        [attributed addAttribute:NSFontAttributeName value:(__bridge NSFont *)run.font range:range];
+        if (height.mode == GPUITextKitLineHeightMode::Exact) {
+            CGFloat natural = CTFontGetAscent(run.font) + CTFontGetDescent(run.font);
+            if (height.height >= natural) {
+                CGFloat offset = std::ceil((height.height - natural) / 2);
+                [attributed addAttribute:NSBaselineOffsetAttributeName value:@(offset) range:range];
+            }
+        }
+    }
+    return attributed;
+}
+
 @interface GPUITextKitCapture : NSLayoutManager
 @property(nonatomic, assign) GPUITextKitLayout *capture;
 @property(nonatomic, assign) NSUInteger sourceGlyph;
 @property(nonatomic, assign) BOOL valid;
 @property(nonatomic, strong) NSFont *emptyFont;
 @property(nonatomic, assign) BOOL emptyRightToLeft;
+@property(nonatomic, strong) NSParagraphStyle *emptyStyle;
 @end
 
 @implementation GPUITextKitCapture
@@ -159,9 +212,20 @@ public:
     // while the typesetter commits its extra fragment, without creating a view.
     if (self.emptyFont && self.textStorage.length == 0) {
         CGFloat height = [self defaultLineHeightForFont:self.emptyFont];
+        if (self.emptyStyle.maximumLineHeight > 0) height = self.emptyStyle.maximumLineHeight;
+        else height = std::max(height, self.emptyStyle.minimumLineHeight);
         fragment.size.height = height;
         used.size.height = height;
-        used.origin.x = self.emptyRightToLeft && container.containerSize.width > 0 ? NSMaxX(fragment) : NSMinX(fragment);
+        CGFloat x = NSMinX(fragment);
+        if (container.containerSize.width > 0) {
+            switch (self.emptyStyle.alignment) {
+                case NSTextAlignmentLeft: break;
+                case NSTextAlignmentCenter: x = NSMidX(fragment); break;
+                case NSTextAlignmentRight: x = NSMaxX(fragment); break;
+                default: if (self.emptyRightToLeft) x = NSMaxX(fragment); break;
+            }
+        }
+        used.origin.x = x;
     }
     [super setExtraLineFragmentRect:fragment usedRect:used textContainer:container];
 }
@@ -184,6 +248,54 @@ public:
 }
 @end
 
+bool captureRows(GPUITextKitCapture *layout, const GPUITextKitOptions &options, GPUITextKitLayout *output) {
+    const auto &wanted = options.carets;
+    CaretPositions carets;
+    CGColorSpaceRef color = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(nullptr, 1, 1, 8, 4, color, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(color);
+    if (!context) return false;
+    NSGraphicsContext *previous = NSGraphicsContext.currentContext;
+    @try {
+        NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:context flipped:YES];
+        GlyphSlots slots;
+        NSUInteger total = layout.numberOfGlyphs;
+        for (NSUInteger cursor = 0; cursor < total;) {
+            NSRange range;
+            NSRect fragment = [layout lineFragmentRectForGlyphAtIndex:cursor effectiveRange:&range withoutAdditionalLayout:YES];
+            NSRect used = [layout lineFragmentUsedRectForGlyphAtIndex:cursor effectiveRange:nullptr withoutAdditionalLayout:YES];
+            if (range.location != cursor || range.length == 0 || range.length > total - cursor) return false;
+            NSRange sourceRange = [layout characterRangeForGlyphRange:range actualGlyphRange:nullptr];
+            output->line = {sourceRange.location, sourceRange.length,
+                {used.origin.x, used.origin.y, used.size.width, used.size.height},
+                {fragment.origin.x, fragment.origin.y, fragment.size.width, fragment.size.height}, 0, 0, false};
+            output->line.carets_available = wantsCarets(wanted, sourceRange.location, sourceRange.length);
+            if (output->line.carets_available
+                && !carets.append(layout, output->line, fragment.origin.x, output->carets)) return false;
+            slots.append(layout, range, fragment.origin, *output);
+            if (!slots.valid) return false;
+            output->glyphs.reserve(range.length);
+            layout.sourceGlyph = NSNotFound;
+            [layout drawGlyphsForGlyphRange:range atPoint:NSZeroPoint];
+            if (!slots.assign(output)) {
+                output->truncateGlyphs(0, 0);
+                for (NSUInteger index = range.location; index < NSMaxRange(range); ++index) {
+                    if ([layout notShownAttributeForGlyphAtIndex:index]) continue;
+                    layout.sourceGlyph = index;
+                    [layout drawGlyphsForGlyphRange:NSMakeRange(index, 1) atPoint:NSZeroPoint];
+                }
+            }
+            if (!layout.valid || !output->emit(&options)) return false;
+            cursor = NSMaxRange(range);
+        }
+    } @finally {
+        NSGraphicsContext.currentContext = previous;
+        CGContextRelease(context);
+    }
+    if (!layout.valid) return false;
+    return true;
+}
+
 GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
     const GPUITextKitFontRun *runs, size_t count, double width, bool rtl, const GPUITextKitOptions *options) {
     try {
@@ -199,17 +311,11 @@ GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
                 const auto *selection = options->selection;
                 if (selection && (selection->start > length || selection->length > length - selection->start)) return nullptr;
                 auto output = std::make_unique<GPUITextKitLayout>();
-                NSString *source = [[NSString alloc] initWithCharacters:text length:length];
-                NSMutableAttributedString *attributed = [[NSMutableAttributedString alloc] initWithString:source];
-                NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
-                style.baseWritingDirection = rtl ? NSWritingDirectionRightToLeft : NSWritingDirectionLeftToRight;
-                style.lineBreakMode = NSLineBreakByWordWrapping;
-                [attributed addAttribute:NSParagraphStyleAttributeName value:style range:NSMakeRange(0, length)];
-                for (size_t index = 0; index < count; ++index) {
-                    if (runs[index].start > length || runs[index].length > length - runs[index].start || !runs[index].font) return nullptr;
-                    [attributed addAttribute:NSFontAttributeName value:(__bridge NSFont *)runs[index].font
-                        range:NSMakeRange(runs[index].start, runs[index].length)];
-                }
+                NSMutableParagraphStyle *style = paragraphStyle(rtl, *options);
+                if (!style) return nullptr;
+                NSMutableAttributedString *attributed = configuredSource(text, length, runs, count, style, options->lineHeight);
+                if (!attributed) return nullptr;
+                NSString *source = attributed.string;
                 NSTextStorage *storage = [[NSTextStorage alloc] initWithAttributedString:attributed];
                 if (![storage.string isEqualToString:source]) return nullptr;
                 GPUITextKitCapture *layout = [[GPUITextKitCapture alloc] init];
@@ -217,6 +323,7 @@ GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
                 layout.valid = YES;
                 if (length == 0) layout.emptyFont = (__bridge NSFont *)runs[count - 1].font;
                 layout.emptyRightToLeft = rtl;
+                layout.emptyStyle = style;
                 layout.backgroundLayoutEnabled = NO;
                 layout.allowsNonContiguousLayout = NO;
                 layout.usesFontLeading = NO;
@@ -226,49 +333,7 @@ GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
                 [layout addTextContainer:container];
                 [storage addLayoutManager:layout];
                 [layout ensureLayoutForTextContainer:container];
-                CaretPositions carets;
-                CGColorSpaceRef color = CGColorSpaceCreateDeviceRGB();
-                CGContextRef context = CGBitmapContextCreate(nullptr, 1, 1, 8, 4, color, kCGImageAlphaPremultipliedLast);
-                CGColorSpaceRelease(color);
-                if (!context) return nullptr;
-                NSGraphicsContext *previous = NSGraphicsContext.currentContext;
-                @try {
-                    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:context flipped:YES];
-                    GlyphSlots slots;
-                    NSUInteger total = layout.numberOfGlyphs;
-                    for (NSUInteger cursor = 0; cursor < total;) {
-                        NSRange range;
-                        NSRect fragment = [layout lineFragmentRectForGlyphAtIndex:cursor effectiveRange:&range withoutAdditionalLayout:YES];
-                        NSRect used = [layout lineFragmentUsedRectForGlyphAtIndex:cursor effectiveRange:nullptr withoutAdditionalLayout:YES];
-                        if (range.location != cursor || range.length == 0 || range.length > total - cursor) return nullptr;
-                        NSRange sourceRange = [layout characterRangeForGlyphRange:range actualGlyphRange:nullptr];
-                        output->line = {sourceRange.location, sourceRange.length,
-                            {used.origin.x, used.origin.y, used.size.width, used.size.height},
-                            {fragment.origin.x, fragment.origin.y, fragment.size.width, fragment.size.height}, 0, 0, false};
-                        output->line.carets_available = wantsCarets(wanted, sourceRange.location, sourceRange.length);
-                        if (output->line.carets_available
-                            && !carets.append(layout, output->line, fragment.origin.x, output->carets)) return nullptr;
-                        slots.append(layout, range, fragment.origin, *output);
-                        if (!slots.valid) return nullptr;
-                        output->glyphs.reserve(range.length);
-                        layout.sourceGlyph = NSNotFound;
-                        [layout drawGlyphsForGlyphRange:range atPoint:NSZeroPoint];
-                        if (!slots.assign(output.get())) {
-                            output->truncateGlyphs(0, 0);
-                            for (NSUInteger index = range.location; index < NSMaxRange(range); ++index) {
-                                if ([layout notShownAttributeForGlyphAtIndex:index]) continue;
-                                layout.sourceGlyph = index;
-                                [layout drawGlyphsForGlyphRange:NSMakeRange(index, 1) atPoint:NSZeroPoint];
-                            }
-                        }
-                        if (!layout.valid || !output->emit(options)) return nullptr;
-                        cursor = NSMaxRange(range);
-                    }
-                } @finally {
-                    NSGraphicsContext.currentContext = previous;
-                    CGContextRelease(context);
-                }
-                if (!layout.valid) return nullptr;
+                if (!captureRows(layout, *options, output.get())) return nullptr;
                 if (layout.extraLineFragmentTextContainer == container) {
                     NSRect fragment = layout.extraLineFragmentRect;
                     NSRect used = layout.extraLineFragmentUsedRect;

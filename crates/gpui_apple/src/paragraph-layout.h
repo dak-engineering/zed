@@ -55,11 +55,19 @@ struct GPUITextKitCaretRequest {
     size_t start;
     size_t length;
 };
+enum class GPUITextKitLineHeightMode : uint8_t { Natural, Exact, AtLeast };
+struct GPUITextKitLineHeight {
+    GPUITextKitLineHeightMode mode = GPUITextKitLineHeightMode::Natural;
+    double height = 0;
+};
+enum class GPUITextKitAlignment : uint8_t { Natural, Left, Center, Right, Justified };
 struct GPUITextKitOptions {
     const GPUITextKitSelection *selection;
     void *context;
     GPUITextKitEmit emit;
     GPUITextKitCaretRequest carets;
+    GPUITextKitLineHeight lineHeight{};
+    GPUITextKitAlignment alignment = GPUITextKitAlignment::Natural;
 };
 extern "C" {
 GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,

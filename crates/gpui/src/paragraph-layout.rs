@@ -20,6 +20,36 @@ pub enum ParagraphWidth {
     Bounded(Pixels),
 }
 
+/// Native paragraph line height, applied during fitting and drawing.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ParagraphLineHeight {
+    /// Native font metrics, without a line-height constraint.
+    #[default]
+    Natural,
+    /// Exact height with the configured fonts centered using an integral baseline offset
+    /// when their ascent plus descent fits. Oversized glyphs may extend outside the row.
+    /// The caller resolves any product-specific height rounding before requesting layout.
+    Exact(Pixels),
+    /// A minimum native height, allowing taller font content.
+    AtLeast(Pixels),
+}
+
+/// Native paragraph alignment; physical left/right do not flip with base direction.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ParagraphAlignment {
+    /// Follow the caller-resolved paragraph base direction.
+    #[default]
+    Natural,
+    /// Align to the physical left edge.
+    Left,
+    /// Center within the fitting width.
+    Center,
+    /// Align to the physical right edge.
+    Right,
+    /// Native justification, retaining native last-row and whitespace behavior.
+    Justified,
+}
+
 /// Which consumed rows need insertion positions from the native layout.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ParagraphCaretCoverage {
@@ -53,6 +83,8 @@ pub struct ParagraphRequest<'source> {
     width: ParagraphWidth,
     direction: ParagraphDirection,
     selection: Option<Range<usize>>,
+    line_height: ParagraphLineHeight,
+    alignment: ParagraphAlignment,
     carets: ParagraphCaretCoverage,
 }
 
@@ -115,8 +147,41 @@ impl<'source> ParagraphRequest<'source> {
             width,
             direction,
             selection: None,
+            line_height: ParagraphLineHeight::Natural,
+            alignment: ParagraphAlignment::Natural,
             carets: ParagraphCaretCoverage::All,
         })
+    }
+
+    /// Applies a native height policy before fitting, glyph placement and selection geometry.
+    ///
+    /// # Errors
+    /// Rejects nonpositive or nonfinite exact/minimum heights.
+    pub fn with_line_height(mut self, height: ParagraphLineHeight) -> anyhow::Result<Self> {
+        if let ParagraphLineHeight::Exact(value) | ParagraphLineHeight::AtLeast(value) = height {
+            ensure!(
+                f32::from(value).is_finite() && value > px(0.),
+                "invalid paragraph line height"
+            );
+        }
+        self.line_height = height;
+        Ok(self)
+    }
+
+    /// Chooses native alignment without changing the resolved paragraph base direction.
+    pub fn with_alignment(mut self, alignment: ParagraphAlignment) -> Self {
+        self.alignment = alignment;
+        self
+    }
+
+    /// Native sizing policy; natural metrics are the default.
+    pub fn line_height(&self) -> ParagraphLineHeight {
+        self.line_height
+    }
+
+    /// Native alignment; natural alignment is the default.
+    pub fn alignment(&self) -> ParagraphAlignment {
+        self.alignment
     }
 
     /// Requests native selection rectangles from this same final layout operation.
