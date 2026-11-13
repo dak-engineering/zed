@@ -1,6 +1,6 @@
 use crate::{Bounds, FontId, FontRun, Pixels, ShapedGlyph, px};
 use anyhow::{Context as _, ensure};
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 /// Resolved paragraph base direction; automatic direction is resolved by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,12 +44,12 @@ impl ParagraphCaretCoverage {
     }
 }
 
-/// A validated contextual layout request borrowing source and resolved font runs.
+/// A validated contextual layout request borrowing source and borrowing or owning resolved font runs.
 #[derive(Clone, Debug)]
 pub struct ParagraphRequest<'source> {
     text: &'source str,
     font_size: Pixels,
-    runs: &'source [FontRun],
+    runs: Cow<'source, [FontRun]>,
     width: ParagraphWidth,
     direction: ParagraphDirection,
     selection: Option<Range<usize>>,
@@ -68,6 +68,15 @@ impl<'source> ParagraphRequest<'source> {
         width: ParagraphWidth,
         direction: ParagraphDirection,
     ) -> anyhow::Result<Self> {
+        Self::try_from_runs(text, font_size, Cow::Borrowed(runs), width, direction)
+    }
+
+    pub(crate) fn validate(
+        text: &str,
+        font_size: Pixels,
+        lengths: impl IntoIterator<Item = usize>,
+        width: ParagraphWidth,
+    ) -> anyhow::Result<()> {
         ensure!(
             f32::from(font_size).is_finite() && font_size > px(0.),
             "invalid paragraph font size"
@@ -79,8 +88,8 @@ impl<'source> ParagraphRequest<'source> {
             );
         }
         let mut consumed = 0usize;
-        for run in runs {
-            let end = consumed.checked_add(run.len).context("font run overflow")?;
+        for len in lengths {
+            let end = consumed.checked_add(len).context("font run overflow")?;
             ensure!(
                 text.get(consumed..end).is_some(),
                 "invalid font run boundary"
@@ -88,6 +97,17 @@ impl<'source> ParagraphRequest<'source> {
             consumed = end;
         }
         ensure!(consumed == text.len(), "font runs must cover the source");
+        Ok(())
+    }
+
+    pub(crate) fn try_from_runs(
+        text: &'source str,
+        font_size: Pixels,
+        runs: Cow<'source, [FontRun]>,
+        width: ParagraphWidth,
+        direction: ParagraphDirection,
+    ) -> anyhow::Result<Self> {
+        Self::validate(text, font_size, runs.iter().map(|run| run.len), width)?;
         Ok(Self {
             text,
             font_size,
@@ -149,8 +169,8 @@ impl<'source> ParagraphRequest<'source> {
     /// Scalar-aligned source byte lengths and platform-resolved font identifiers.
     /// For empty source, the last supplied zero-length run selects the font;
     /// no runs selects the backend's default font at the requested size.
-    pub fn runs(&self) -> &'source [FontRun] {
-        self.runs
+    pub fn runs(&self) -> &[FontRun] {
+        &self.runs
     }
     /// Explicit bounded or unbounded fitting policy.
     pub fn width(&self) -> ParagraphWidth {

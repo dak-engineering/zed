@@ -13,8 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    Bounds, DevicePixels, Hsla, ParagraphDirection, ParagraphRequest, ParagraphWidth, Pixels,
+    PlatformTextSystem, Point, Result, SharedString, Size, StrikethroughStyle, TextRenderingMode,
+    UnderlineStyle, px,
 };
 use anyhow::Context as _;
 use collections::{FxHashMap, FxHashSet};
@@ -873,6 +874,31 @@ impl WindowTextSystem {
             .layout_line(text, font_size, &font_runs, force_width);
         self.font_runs_buffer.set(font_runs);
         layout
+    }
+
+    /// Resolves styled source with the same font and decoration boundaries as line shaping.
+    /// The request borrows the source and owns its resolved fonts; styles may be dropped afterward.
+    /// Selection and insertion-position coverage are configured on the returned request.
+    ///
+    /// # Errors
+    /// Rejects invalid sizing, incomplete coverage, overflow or non-scalar UTF-8 style boundaries
+    /// before resolving fonts.
+    pub fn paragraph_request<'source>(
+        &self,
+        text: &'source str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        width: ParagraphWidth,
+        direction: ParagraphDirection,
+    ) -> Result<ParagraphRequest<'source>> {
+        ParagraphRequest::validate(text, font_size, runs.iter().map(|run| run.len), width)?;
+        ParagraphRequest::try_from_runs(
+            text,
+            font_size,
+            Cow::Owned(self.font_runs(runs)),
+            width,
+            direction,
+        )
     }
 
     fn font_runs(&self, runs: &[TextRun]) -> Vec<FontRun> {
