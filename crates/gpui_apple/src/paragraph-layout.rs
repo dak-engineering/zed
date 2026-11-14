@@ -101,6 +101,7 @@ struct NativeOptions {
     attachment_count: usize,
     max_lines: usize,
     ellipsize: u8,
+    line_break_strategy: u8,
 }
 
 impl NativeOptions {
@@ -116,6 +117,12 @@ impl NativeOptions {
             carets: NativeCaretRequest::from_request(request),
             line_height: request.line_height().into(),
             alignment: alignment(request.alignment()),
+            line_break_strategy: match request.line_break_strategy() {
+                gpui::ParagraphLineBreakStrategy::None => 0,
+                gpui::ParagraphLineBreakStrategy::Standard => 1,
+                gpui::ParagraphLineBreakStrategy::HangulWord => 2,
+                gpui::ParagraphLineBreakStrategy::PushOut => 3,
+            },
             paragraphs: std::ptr::null(),
             paragraph_count: 0,
             attachments: std::ptr::null(),
@@ -867,3 +874,7 @@ fn source_attachments(
 #[cfg(test)]
 #[path = "document-truncation-tests.rs"]
 mod document_truncation_tests;
+
+#[cfg(test)]
+#[path = "line-break-strategy-tests.rs"]
+mod line_break_strategy_tests;

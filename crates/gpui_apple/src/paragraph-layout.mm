@@ -166,6 +166,19 @@ NSMutableParagraphStyle *paragraphStyle(GPUITextKitDirection direction, const GP
         default: return nil;
     }
     style.lineBreakMode = NSLineBreakByWordWrapping;
+    switch (options.lineBreakStrategy) {
+        case GPUITextKitLineBreakStrategy::None: style.lineBreakStrategy = NSLineBreakStrategyNone; break;
+        case GPUITextKitLineBreakStrategy::Standard:
+            if (@available(macOS 11.0, *)) style.lineBreakStrategy = NSLineBreakStrategyStandard;
+            else return nil;
+            break;
+        case GPUITextKitLineBreakStrategy::HangulWord:
+            if (@available(macOS 11.0, *)) style.lineBreakStrategy = NSLineBreakStrategyHangulWordPriority;
+            else return nil;
+            break;
+        case GPUITextKitLineBreakStrategy::PushOut: style.lineBreakStrategy = NSLineBreakStrategyPushOut; break;
+        default: return nil;
+    }
     switch (height.mode) {
         case GPUITextKitLineHeightMode::Natural:
             if (height.height != 0) return nil;

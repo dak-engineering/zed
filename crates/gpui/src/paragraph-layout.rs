@@ -61,6 +61,15 @@ pub enum ParagraphAlignment {
     Justified,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParagraphLineBreakStrategy {
+    #[default]
+    None,
+    Standard,
+    HangulWord,
+    PushOut,
+}
+
 /// Replacement policy applied by the native document text container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParagraphEllipsize {
@@ -170,6 +179,7 @@ pub struct ParagraphRequest<'source> {
     selection: Option<Range<usize>>,
     line_height: ParagraphLineHeight,
     alignment: ParagraphAlignment,
+    line_break_strategy: ParagraphLineBreakStrategy,
     carets: ParagraphCaretCoverage,
     font_sizes: Option<Vec<Pixels>>,
     baseline_offsets: Option<Vec<Pixels>>,
@@ -239,6 +249,7 @@ impl<'source> ParagraphRequest<'source> {
             selection: None,
             line_height: ParagraphLineHeight::Natural,
             alignment: ParagraphAlignment::Natural,
+            line_break_strategy: ParagraphLineBreakStrategy::None,
             carets: ParagraphCaretCoverage::All,
             font_sizes: None,
             baseline_offsets: None,
@@ -405,6 +416,15 @@ impl<'source> ParagraphRequest<'source> {
     pub fn with_alignment(mut self, alignment: ParagraphAlignment) -> Self {
         self.alignment = alignment;
         self
+    }
+
+    pub fn with_line_break_strategy(mut self, strategy: ParagraphLineBreakStrategy) -> Self {
+        self.line_break_strategy = strategy;
+        self
+    }
+
+    pub fn line_break_strategy(&self) -> ParagraphLineBreakStrategy {
+        self.line_break_strategy
     }
 
     /// Native sizing policy; natural metrics are the default.

@@ -65,6 +65,7 @@ struct GPUITextKitLineHeight {
     double height = 0;
 };
 enum class GPUITextKitAlignment : uint8_t { Natural, Left, Center, Right, Justified };
+enum class GPUITextKitLineBreakStrategy : uint8_t { None, Standard, HangulWord, PushOut };
 enum class GPUITextKitEllipsize : uint8_t { Head, Middle, Tail, Clip };
 struct GPUITextKitParagraphSpan {
     size_t start;
@@ -103,6 +104,7 @@ struct GPUITextKitOptions {
     size_t attachmentCount = 0;
     size_t maxLines = 0;
     GPUITextKitEllipsize ellipsize = GPUITextKitEllipsize::Tail;
+    GPUITextKitLineBreakStrategy lineBreakStrategy = GPUITextKitLineBreakStrategy::None;
 };
 extern "C" {
 GPUITextKitLayout *gpui_textkit_layout(const uint16_t *text, size_t length,
