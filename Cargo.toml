@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/accesskit-macos",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -532,7 +533,7 @@ ztracing_macro = { path = "crates/ztracing_macro" }
 #
 
 accesskit = { version = "0.24.0", features = ["enumn"] }
-accesskit_macos = "0.26.0"
+accesskit_macos = { path = "crates/accesskit-macos", version = "0.26.3" }
 accesskit_unix = "0.22"
 accesskit_windows = "0.34"
 agent-client-protocol = { version = "=5.1.0", features = ["schemars", "unstable", "unstable_protocol_v2"] }
